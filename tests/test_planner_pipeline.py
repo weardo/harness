@@ -471,7 +471,7 @@ class TestPipelineModelResolution:
 
         calls_with_model = []
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             calls_with_model.append(options.get("model"))
             return make_mock_agent_result()
 
@@ -524,7 +524,7 @@ class TestPipelineResume:
 
         run_calls = []
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             run_calls.append(True)
             return make_mock_agent_result()
 
@@ -604,7 +604,7 @@ class TestPipelineLegacyState:
 
         run_calls = []
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             run_calls.append(True)
             return make_mock_agent_result()
 
@@ -658,7 +658,7 @@ class TestPipelineRetry:
 
         run_count = [0]
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             run_count[0] += 1
             # After first run: write invalid artifact
             # After second run: write valid artifact

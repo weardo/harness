@@ -5,21 +5,35 @@ Env-gated: only active when HARNESS_CONTROL_PLANE_URL is set.
 All HTTP calls are non-blocking (daemon threads, fire-and-forget).
 All calls are wrapped in try/except — never affects harness behavior.
 Uses stdlib only: os, json, threading, urllib.
+
+Offline buffering: when the control plane is down, events are spooled to
+.harness/event_buffer.jsonl. A drain thread replays them when the control
+plane comes back online.
 """
 import json
 import os
 import threading
+import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 
 class ControlPlaneClient:
-    def __init__(self):
+    def __init__(self, state_dir: Path | str | None = None):
         url = os.environ.get("HARNESS_CONTROL_PLANE_URL", "").strip()
         self.enabled = bool(url)
         self._base_url = url.rstrip("/") if url else ""
         self._api_key = os.environ.get("HARNESS_API_KEY", "")
         self.run_id: str | None = None
+        self._cp_available = True  # optimistic; flipped on first failure
+        self._buffer_path: Path | None = None
+        self._buffer_lock = threading.Lock()
+        self._drain_started = False
+        if state_dir:
+            p = Path(state_dir)
+            p.mkdir(parents=True, exist_ok=True)
+            self._buffer_path = p / "event_buffer.jsonl"
 
     def _post(self, path: str, body: dict) -> dict | None:
         """Synchronous HTTP POST — call from a daemon thread."""
@@ -37,9 +51,69 @@ class ControlPlaneClient:
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 raw = resp.read()
+                if not self._cp_available:
+                    self._cp_available = True
+                    self._start_drain()
                 return json.loads(raw) if raw else None
         except Exception:
+            self._cp_available = False
             return None
+
+    def _buffer_event(self, path: str, body: dict) -> None:
+        """Append a failed event to the local buffer file."""
+        if not self._buffer_path:
+            return
+        entry = json.dumps({"path": path, "body": body})
+        with self._buffer_lock:
+            with open(self._buffer_path, "a") as f:
+                f.write(entry + "\n")
+
+    def _start_drain(self) -> None:
+        """Start a background thread to replay buffered events."""
+        if self._drain_started or not self._buffer_path:
+            return
+        self._drain_started = True
+        t = threading.Thread(target=self._drain_buffer, daemon=True)
+        t.start()
+
+    def _drain_buffer(self) -> None:
+        """Replay buffered events to the control plane."""
+        if not self._buffer_path or not self._buffer_path.exists():
+            self._drain_started = False
+            return
+        try:
+            with self._buffer_lock:
+                lines = self._buffer_path.read_text().strip().split("\n")
+                self._buffer_path.unlink(missing_ok=True)
+        except Exception:
+            self._drain_started = False
+            return
+
+        replayed = 0
+        failed_lines = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                result = self._post(entry["path"], entry["body"])
+                if result is not None:
+                    replayed += 1
+                else:
+                    failed_lines.append(line)
+            except Exception:
+                failed_lines.append(line)
+
+        # Re-buffer any that still failed
+        if failed_lines and self._buffer_path:
+            with self._buffer_lock:
+                with open(self._buffer_path, "a") as f:
+                    for fl in failed_lines:
+                        f.write(fl + "\n")
+
+        if replayed > 0:
+            print(f"  [control-plane] Drained {replayed} buffered event(s)")
+        self._drain_started = False
 
     def _fire(self, fn):
         """Run fn in a daemon thread — fire-and-forget."""
@@ -75,6 +149,7 @@ class ControlPlaneClient:
         """Register a new run with the control plane.
 
         Auto-registers the project if it doesn't exist yet.
+        Drains any buffered events from a previous run on successful connection.
         """
         if not self.enabled:
             return
@@ -85,26 +160,30 @@ class ControlPlaneClient:
                 result = self._post("/api/v1/runs", {"project_id": project_id, "features_planned": 0})
                 if result and "id" in result:
                     self.run_id = result["id"]
+                    # Drain leftover events from previous run
+                    if self._buffer_path and self._buffer_path.exists():
+                        self._start_drain()
             except Exception:
                 pass
 
         _do()
 
     def post_event(self, event_type: str, **kwargs) -> None:
-        """Post a run event asynchronously."""
+        """Post a run event asynchronously. Buffers locally if control plane is down."""
         if not self.enabled or not self.run_id:
             return
 
         run_id = self.run_id
+        path = f"/api/v1/runs/{run_id}/events"
+        body = {"event_type": event_type, **kwargs}
 
         def _do():
             try:
-                self._post(
-                    f"/api/v1/runs/{run_id}/events",
-                    {"event_type": event_type, **kwargs},
-                )
+                result = self._post(path, body)
+                if result is None:
+                    self._buffer_event(path, body)
             except Exception:
-                pass
+                self._buffer_event(path, body)
 
         self._fire(_do)
 

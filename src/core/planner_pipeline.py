@@ -402,6 +402,55 @@ async def run_planner_pipeline(  # noqa: C901
     state = state_mgr.load_state()
     planner_roles_done = state.get("planner_roles", {})  # default {} if missing (031)
 
+    # Pre-loop: if resuming and validator previously rejected, fix work_plan before re-running validator
+    validation_path = state_dir / "validation.json"
+    if planner_roles_done.get("refiner") and not planner_roles_done.get("validator") and validation_path.exists():
+        try:
+            import json as _json
+            validation_data = _json.loads(validation_path.read_text())
+            if not validation_data.get("sign_off") and validation_data.get("issues"):
+                issues = validation_data["issues"]
+                print(f"\n  Previous Validator rejected ({len(issues)} issues) — running Refiner-fix first...")
+
+                if event_tracker:
+                    event_tracker.planner_role_start("refiner-fix", f"Fixing {len(issues)} validator issues")
+
+                from .orchestrator import run_agent_session  # noqa: PLC0415
+
+                refiner_role = next((r for r in roles if r.get("name") == "refiner"), None)
+                if refiner_role:
+                    issues_json = _json.dumps(issues, indent=2)
+                    fix_prompt = (
+                        "# Fix Validator Issues in work_plan.json\n\n"
+                        "The Validator found issues in the work plan. Fix them by modifying work_plan.json.\n\n"
+                        "## Issues to fix:\n\n"
+                        f"```json\n{issues_json}\n```\n\n"
+                        "## Instructions:\n\n"
+                        "1. Read the current work_plan.json from the state directory\n"
+                        "2. Apply each fix (usually adding depends_on entries to serialize shared-file access)\n"
+                        "3. Write the updated work_plan.json back\n"
+                        "4. Do NOT change task descriptions, acceptance_criteria, or steps — only fix the issues listed\n\n"
+                        f"State directory: {state_dir}\n"
+                    )
+                    model = _resolve_model(refiner_role.get("model", "sonnet"), config)
+                    fix_options = create_client_options(project_dir, config, model_override=model)
+                    fix_result = await run_agent_session(
+                        fix_prompt, fix_options, Path(project_dir),
+                        progress_label="Planner/refiner-fix"
+                    )
+                    fix_cost = fix_result.get("cost", 0.0)
+                    total_cost += fix_cost
+                    cost_tracker.record("planner", fix_cost)
+                    print(f"  refiner-fix: complete. Cost: ${fix_cost:.2f}")
+
+                    # Remove old validation so Validator runs fresh
+                    validation_path.unlink(missing_ok=True)
+
+                    if event_tracker:
+                        event_tracker.planner_role_pass("refiner-fix", "work_plan.json", 0)
+        except Exception as e:
+            print(f"  Refiner-fix pre-loop failed (non-fatal): {e}")
+
     for role in roles:
         role_name = role.get("name", "")
         artifact = role.get("artifact", "")
@@ -436,7 +485,7 @@ async def run_planner_pipeline(  # noqa: C901
 
         # Run agent session (feature 026)
         t_start = time.time()
-        result = await run_agent_session(full_prompt, options, Path(project_dir))
+        result = await run_agent_session(full_prompt, options, Path(project_dir), progress_label=f"Planner/{role_name}")
         duration_ms = int((time.time() - t_start) * 1000)
         cost = result.get("cost", 0.0)
         total_cost += cost
@@ -460,7 +509,7 @@ async def run_planner_pipeline(  # noqa: C901
                 + f"\n\nVALIDATION FAILED: {reason}\n\nYour previous output:\n{artifact_content}"
             )
             retry_options = create_client_options(project_dir, config, model_override=model)
-            retry_result = await run_agent_session(retry_prompt, retry_options, Path(project_dir))
+            retry_result = await run_agent_session(retry_prompt, retry_options, Path(project_dir), progress_label=f"Planner/{role_name} (retry)")
             retry_cost = retry_result.get("cost", 0.0)
             total_cost += retry_cost
             cost_tracker.record("planner", retry_cost)
@@ -480,6 +529,57 @@ async def run_planner_pipeline(  # noqa: C901
 
         if event_tracker:
             event_tracker.planner_role_pass(role_name, artifact, duration_ms)
+
+    # Validator → Refiner feedback loop: if validator rejected, re-run refiner with issues
+    validation_path = state_dir / "validation.json"
+    if validation_path.exists():
+        try:
+            import json as _json
+            validation_data = _json.loads(validation_path.read_text())
+            if not validation_data.get("sign_off") and validation_data.get("issues"):
+                issues = validation_data["issues"]
+                print(f"\n  Validator rejected ({len(issues)} issues) — re-running Refiner to fix...")
+
+                if event_tracker:
+                    event_tracker.planner_role_start("refiner-fix", f"Fixing {len(issues)} validator issues")
+
+                # Find the refiner role config
+                refiner_role = next((r for r in roles if r.get("name") == "refiner"), None)
+                if refiner_role:
+                    from .orchestrator import run_agent_session, load_prompt
+
+                    # Build a targeted fix prompt — only the issues, not full context
+                    issues_json = _json.dumps(issues, indent=2)
+                    work_plan_content = _read_artifact(state_dir, "work_plan.json")
+
+                    fix_prompt = (
+                        "# Fix Validator Issues in work_plan.json\n\n"
+                        "The Validator found issues in the work plan. Fix them by modifying work_plan.json.\n\n"
+                        "## Issues to fix:\n\n"
+                        f"```json\n{issues_json}\n```\n\n"
+                        "## Instructions:\n\n"
+                        "1. Read the current work_plan.json from the state directory\n"
+                        "2. Apply each fix (usually adding depends_on entries to serialize shared-file access)\n"
+                        "3. Write the updated work_plan.json back\n"
+                        "4. Do NOT change task descriptions, acceptance_criteria, or steps — only fix the issues listed\n\n"
+                        f"State directory: {state_dir}\n"
+                    )
+
+                    model = _resolve_model(refiner_role.get("model", "sonnet"), config)
+                    fix_options = create_client_options(project_dir, config, model_override=model)
+                    fix_result = await run_agent_session(
+                        fix_prompt, fix_options, Path(project_dir),
+                        progress_label="Planner/refiner-fix"
+                    )
+                    fix_cost = fix_result.get("cost", 0.0)
+                    total_cost += fix_cost
+                    cost_tracker.record("planner", fix_cost)
+                    print(f"  refiner-fix: complete. Cost: ${fix_cost:.2f}")
+
+                    if event_tracker:
+                        event_tracker.planner_role_pass("refiner-fix", "work_plan.json", 0)
+        except Exception as e:
+            print(f"  Validator feedback loop failed (non-fatal): {e}")
 
     # All roles done → mark pipeline complete (feature 030)
     state_mgr.update_state(planner_complete=True)

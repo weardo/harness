@@ -42,6 +42,13 @@ planner:
   max_features: 200
   require_acceptance_criteria: true
 
+# Delegation dial — controls how much the model decides vs follows instructions
+# full-plan:    4-role pipeline, detailed steps per task, procedural generator (current default)
+# guided:       single planner, acceptance_criteria + constraints (no steps), lean generator
+# outcome-only: single planner, just criteria + test command, model decides everything
+delegation:
+  mode: full-plan
+
 # Security
 security:
   sandbox: true

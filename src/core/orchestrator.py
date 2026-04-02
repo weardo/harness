@@ -35,6 +35,20 @@ from . import fleet_session
 # Delay between sessions
 AUTO_CONTINUE_DELAY = 3
 
+# Delegation mode prompt mapping
+_DELEGATION_PROMPTS = {
+    "full-plan": {"architect": "architect.md", "generator": "generator.md"},
+    "guided": {"architect": "architect-guided.md", "generator": "generator-guided.md"},
+    "outcome-only": {"architect": "architect-outcome.md", "generator": "generator-outcome.md"},
+}
+
+
+def resolve_prompt(role: str, config: dict) -> str:
+    """Return prompt filename for the given role based on delegation.mode config."""
+    mode = config.get("delegation", {}).get("mode", "full-plan")
+    mapping = _DELEGATION_PROMPTS.get(mode, _DELEGATION_PROMPTS["full-plan"])
+    return mapping.get(role, f"{role}.md")
+
 
 def load_prompt(prompt_path: Path, replacements: Optional[dict] = None) -> str:
     """Load a prompt template and apply replacements."""
@@ -71,11 +85,15 @@ async def run_agent_session(
     prompt: str,
     options: dict,
     project_dir: Path,
+    progress_label: str = "",
 ) -> dict:
     """Run a single agent session using Claude Agent SDK.
 
     Falls back to `claude -p` CLI if no ANTHROPIC_API_KEY is set,
     allowing the harness to run on a Claude subscription without a key.
+
+    Args:
+        progress_label: If set, print streaming progress markers (e.g., "Planner").
 
     Returns {status, output, cost, usage, session_id}.
     """
@@ -109,6 +127,9 @@ async def run_agent_session(
     cost_usd = 0.0
     usage = {}
     session_id = None
+    _tool_count = 0
+    _text_chars = 0
+    _last_progress = 0
 
     try:
         async with client:
@@ -120,8 +141,34 @@ async def run_agent_session(
                     for block in msg.content:
                         if type(block).__name__ == "TextBlock" and hasattr(block, "text"):
                             output_text += block.text
+                            _text_chars += len(block.text)
+                            # Print progress markers every ~2000 chars
+                            if progress_label and _text_chars - _last_progress > 2000:
+                                _last_progress = _text_chars
+                                # Detect what's being generated from content
+                                marker = ""
+                                if "## Architecture" in block.text:
+                                    marker = "architecture"
+                                elif "## Features" in block.text or "## Success Criteria" in block.text:
+                                    marker = "features"
+                                elif "## Data Model" in block.text or "## Security" in block.text:
+                                    marker = "data model"
+                                elif '"phases"' in block.text:
+                                    marker = "work plan"
+                                elif '"acceptance_criteria"' in block.text:
+                                    marker = "tasks"
+                                elif "## Constraints" in block.text:
+                                    marker = "constraints"
+                                if marker:
+                                    print(f"  [{progress_label}] generating {marker}...", flush=True)
+                                else:
+                                    print(f"  [{progress_label}] {_text_chars // 1000}k chars...", flush=True)
                         elif type(block).__name__ == "ToolUseBlock" and hasattr(block, "name"):
-                            print(f"  [Tool: {block.name}]", flush=True)
+                            _tool_count += 1
+                            if progress_label:
+                                print(f"  [{progress_label}] tool: {block.name} (#{_tool_count})", flush=True)
+                            else:
+                                print(f"  [Tool: {block.name}]", flush=True)
 
                 elif msg_type == "ResultMessage":
                     cost_usd = getattr(msg, "total_cost_usd", 0) or 0
@@ -299,7 +346,7 @@ async def run_parallel_wave(
                 "TEST_COMMAND": test_command,
                 "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
             }
-            gen_prompt = load_prompt(prompts_dir / "generator.md", gen_replacements)
+            gen_prompt = load_prompt(prompts_dir / resolve_prompt("generator", config), gen_replacements)
             if relay_context:
                 gen_prompt = relay_context + "\n\n" + gen_prompt
             gen_options = create_client_options(wt_dir, config)
@@ -449,7 +496,7 @@ async def run_harness(
     cost_tracker = CostTracker()
     prompts_dir = Path(__file__).parent.parent / "prompts"
 
-    cp = ControlPlaneClient()
+    cp = ControlPlaneClient(state_dir=state_dir)
     try:
         cp.create_run(project_dir.name, str(project_dir))
     except Exception:
@@ -502,17 +549,24 @@ async def run_harness(
     chunk_count = len(knowledge_section.split("\n\n")) if knowledge_section else 0
     tracker.knowledge_query(chunk_count)
 
-    # Determine strategy (feature 038)
+    # Determine strategy (feature 038) + delegation mode
+    delegation_mode = config.get("delegation", {}).get("mode", "full-plan")
     default_strategy = config.get("default_strategy")
     strategies = config.get("strategies", {})
-    use_pipeline = bool(default_strategy and strategies.get(default_strategy))
+    # Only use multi-role pipeline in full-plan mode
+    use_pipeline = bool(
+        delegation_mode == "full-plan"
+        and default_strategy
+        and strategies.get(default_strategy)
+    )
 
     # === PHASE 1: PLANNER ===
-    if not state.get("planner_complete") and not resume:
-        print("--- PHASE 1: PLANNER ---")
+    # Run planner if not complete — resume skips completed roles internally via planner_roles state
+    if not state.get("planner_complete"):
+        print(f"--- PHASE 1: PLANNER (delegation: {delegation_mode}){' (resuming)' if resume else ''} ---")
 
         if use_pipeline:
-            # Feature 038: multi-phase pipeline
+            # Feature 038: multi-phase pipeline (full-plan mode only)
             strategy_config = strategies[default_strategy]
             input_section = _build_input_section(prompt, spec_path, plan_path)
             await run_planner_pipeline(
@@ -531,7 +585,7 @@ async def run_harness(
         else:
             # Feature 039: legacy single-session planner
             planner_prompt = build_planner_prompt(
-                prompts_dir, prompt, spec_path, plan_path, state_dir
+                prompts_dir, prompt, spec_path, plan_path, state_dir, config
             )
             planner_options = create_client_options(
                 project_dir,
@@ -539,9 +593,9 @@ async def run_harness(
                 model_override=config.get("planner_model"),
                 system_prompt="You are a product architect designing a comprehensive application specification.",
             )
-            result = await run_agent_session(planner_prompt, planner_options, project_dir)
+            result = await run_agent_session(planner_prompt, planner_options, project_dir, progress_label="Planner")
             cost_tracker.record("planner", result["cost"])
-            print(f"Planner complete. Cost: ${result['cost']:.2f}")
+            print(f"  [Planner] complete. Cost: ${result['cost']:.2f}")
             use_work_plan = False
 
         state_mgr.update_state(
@@ -790,7 +844,7 @@ async def run_harness(
             "TEST_COMMAND": test_command or "echo 'No test command configured'",
             "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
         }
-        gen_prompt = load_prompt(prompts_dir / "generator.md", gen_replacements)
+        gen_prompt = load_prompt(prompts_dir / resolve_prompt("generator", config), gen_replacements)
         gen_options = create_client_options(project_dir, config)
 
         gen_result = await run_agent_session(gen_prompt, gen_options, project_dir)
@@ -1147,13 +1201,20 @@ def build_planner_prompt(
     spec_path: Optional[Path],
     plan_path: Optional[Path],
     state_dir: Path,
+    config: Optional[dict] = None,
 ) -> str:
     """Build the planner prompt based on input mode.
 
     Queries the knowledge DB for past learnings and appends them
     to the planner context so it can guard against known failure modes.
+    Uses delegation mode to select the appropriate architect prompt.
     """
-    base = load_prompt(prompts_dir / "planner.md", {"STATE_DIR": str(state_dir)})
+    architect_prompt = resolve_prompt("architect", config or {})
+    prompt_file = prompts_dir / architect_prompt
+    # Fall back to planner.md if the delegation-mode prompt doesn't exist
+    if not prompt_file.exists():
+        prompt_file = prompts_dir / "planner.md"
+    base = load_prompt(prompt_file, {"STATE_DIR": str(state_dir)})
 
     # Inject knowledge from past runs
     knowledge_section = _query_knowledge_for_planner()

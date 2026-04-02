@@ -323,7 +323,7 @@ class TestPipelineResume:
 
         run_calls = []
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             run_calls.append(True)
             return {"status": "success", "output": "", "cost": 0.1}
 
@@ -385,7 +385,7 @@ class TestPipelineResume:
 
         run_calls = []
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             run_calls.append(True)
             return {"status": "success", "output": "", "cost": 0.1}
 
@@ -436,7 +436,7 @@ class TestPipelineResume:
 
         state_mgr = StateManager(state_dir)
 
-        async def mock_run(prompt, options, project_dir):
+        async def mock_run(prompt, options, project_dir, **kwargs):
             return {"status": "success", "output": "", "cost": 0.0}
 
         with patch("src.core.orchestrator.run_agent_session", new=mock_run), \
