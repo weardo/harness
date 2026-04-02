@@ -1,0 +1,16 @@
+state/
+__pycache__/
+*.pyc
+.cache/
+.claude_settings.json
+.worktrees/
+node_modules/
+*.png
+*.jpg
+claude-progress.txt
+retrospective.json
+RETROSPECTIVE.md
+test-projects/
+.pytest_cache/
+.harness/
+.venv/

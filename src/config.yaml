@@ -1,0 +1,166 @@
+# Long-Running Agent Harness Configuration
+
+model: "claude-sonnet-4-6"
+planner_model: "claude-opus-4-6"
+effort: "high"
+
+# Limits (any triggers exit)
+max_cost_usd: 100.0
+max_duration_minutes: 240
+max_iterations: 50
+
+# Circuit breaker
+circuit_breaker:
+  no_progress_threshold: 3
+  same_error_threshold: 3
+  output_decline_pct: 0.7
+  cooldown_seconds: 300
+  max_open_count: 2
+
+# Generator
+generator:
+  max_turns_per_session: 1000
+  max_retries_per_feature: 3
+  regression_check: true
+  auto_continue_delay: 3
+
+# Evaluator
+evaluator:
+  test_suite_command: "npm test"
+  browser_verification: auto
+  browser_tool: playwright
+  criteria_weights:
+    functionality: 1.0
+    correctness: 1.0
+    design_quality: 0.5
+    originality: 0.3
+  min_passing_score: 7
+
+# Planner
+planner:
+  min_features: 20
+  max_features: 200
+  require_acceptance_criteria: true
+
+# Security
+security:
+  sandbox: true
+  permission_mode: "acceptEdits"
+  allowed_bash_commands:
+    - ls
+    - cat
+    - head
+    - tail
+    - wc
+    - grep
+    - cp
+    - mkdir
+    - chmod
+    - pwd
+    - npm
+    - node
+    - npx
+    - python
+    - python3
+    - pip
+    - pip3
+    - pytest
+    - go
+    - cargo
+    - git
+    - ps
+    - lsof
+    - sleep
+    - pkill
+    - init.sh
+  deny_reads:
+    - ".env"
+    - ".env.*"
+    - "~/.ssh/**"
+    - "~/.aws/**"
+    - "~/.anthropic/**"
+  deny_patterns:
+    - "sudo *"
+    - "rm -rf /"
+    - "git push --force"
+    - "git commit --no-verify"
+  block_command_substitution: true
+
+# Parallel (Fleet mode — Citadel-inspired wave mechanics)
+parallel:
+  enabled: false
+  max_workers: 3
+  strategy: "dependency"
+  merge_strategy: "requeue"
+  agent_timeout_minutes: 30
+  discovery_relay: true
+  stale_instance_hours: 2
+
+# Environment
+env:
+  XDG_CACHE_HOME: ".cache"
+  npm_config_cache: ".cache/npm"
+  PIP_CACHE_DIR: ".cache/pip"
+
+# Knowledge injection
+knowledge:
+  inject_into_planner: true
+  max_chunks: 10
+  chunk_types:
+    - learning
+    - pattern
+    - failure
+
+# Worktree lifecycle management
+worktree:
+  sweep_on_start: true
+  sweep_on_end: true
+  read_only_guard: true
+
+# Suspicion / anomaly detection
+suspicion:
+  enabled: true
+  min_retry_rate: 0.3
+  min_avg_feature_seconds: 30
+
+# Planner pipeline strategies
+strategies:
+  feature:
+    planner_roles:
+      - name: architect
+        model: opus
+        prompt: architect.md
+        artifact: draft_work_plan.json
+        also_produces: [spec.md]
+        validation:
+          type: work_plan
+          min_tasks: 5
+          min_phases: 1
+          require_acceptance_criteria: true
+      - name: adversary
+        model: opus
+        prompt: adversary.md
+        artifact: spec_gaps.json
+        validation:
+          type: spec_gaps
+          min_gaps: 3
+          required_categories: ["technical", "ai_failure_mode", "community"]
+      - name: refiner
+        model: sonnet
+        prompt: refiner.md
+        artifact: work_plan.json
+        validation:
+          type: work_plan
+          min_tasks: 5
+          min_phases: 1
+          require_acceptance_criteria: true
+      - name: validator
+        model: opus
+        prompt: validator.md
+        artifact: validation.json
+        also_produces: [init.sh]
+        validation:
+          type: validation
+          require_sign_off: true
+
+default_strategy: feature

@@ -1,0 +1,33 @@
+# Retrospective: {PROJECT_NAME}
+Date: {DATE} | Duration: {DURATION} | Score: {FEATURES_IMPLEMENTED}/{FEATURES_PLANNED}
+
+## Planner Performance (score /10)
+- Score:
+- Feature list quality:
+- Spec gaps found during build:
+- What planner should do differently:
+
+## Generator Performance (score /10)
+- Score:
+- Features built cleanly:
+- Features with likely silent failures:
+- Common failure patterns:
+- What generator should do differently:
+
+## Evaluator Performance (score /10)
+- Score:
+- What evaluator caught:
+- What evaluator missed:
+- Blind spots observed:
+- What evaluator should check differently:
+
+## Failure Modes Observed
+<!-- New failure modes to add to future generator prompts -->
+
+## Spec Patterns That Worked
+<!-- What spec conventions produced clean generator output -->
+
+## Community Conventions Discovered
+<!-- Patterns from docs/GitHub issues that should inform future prompts -->
+
+## Overall Score: /10

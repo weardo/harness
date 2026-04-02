@@ -1,0 +1,30 @@
+{
+  "project": "{PROJECT_NAME}",
+  "date": "{DATE}",
+  "duration": "{DURATION}",
+  "score": "{FEATURES_IMPLEMENTED}/{FEATURES_PLANNED}",
+  "planner": {
+    "score": null,
+    "feature_list_quality": "",
+    "spec_gaps_found": "",
+    "should_do_differently": ""
+  },
+  "generator": {
+    "score": null,
+    "features_built_cleanly": "",
+    "silent_failures": "",
+    "common_failure_patterns": "",
+    "should_do_differently": ""
+  },
+  "evaluator": {
+    "score": null,
+    "what_caught": "",
+    "what_missed": "",
+    "blind_spots": "",
+    "should_check_differently": ""
+  },
+  "failure_modes": [],
+  "patterns": [],
+  "conventions": [],
+  "overall_score": null
+}
