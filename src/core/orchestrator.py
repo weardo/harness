@@ -991,7 +991,8 @@ async def run_parallel_wave(
         gen_status = r["gen_status"]
         qa_result = r["qa_result"]
 
-        cost_tracker.record("generator", gen_result.get("cost", 0), **_metrics_from(gen_result))
+        cost_tracker.record("generator", gen_result.get("cost", 0),
+                            phase="generator-pool", **_metrics_from(gen_result))
         cost_tracker.record_feature(feature_id, "generator", gen_result.get("cost", 0))
 
         # Compress discovery brief + write to shared knowledge dir
@@ -1038,7 +1039,8 @@ async def run_parallel_wave(
             continue
 
         # Record QA cost
-        cost_tracker.record("evaluator", qa_result.get("cost", 0), **_metrics_from(qa_result))
+        cost_tracker.record("evaluator", qa_result.get("cost", 0),
+                            phase="evaluator-pool", **_metrics_from(qa_result))
         cost_tracker.record_feature(feature_id, "evaluator", qa_result.get("cost", 0))
 
         if "VERDICT: FAIL" in qa_result.get("output", ""):
@@ -1324,7 +1326,8 @@ async def resume_interrupted_workers(
                 print(f"  Recovery eval crashed: {item}")
                 continue
             wid, assignment, wt_dir, branch, feature_id, eval_result = item
-            cost_tracker.record("evaluator", eval_result.get("cost", 0), **_metrics_from(eval_result))
+            cost_tracker.record("evaluator", eval_result.get("cost", 0),
+                                phase="evaluator-recovery", **_metrics_from(eval_result))
 
             if "VERDICT: FAIL" not in eval_result.get("output", ""):
                 # Passed — merge sequentially (touches main)
@@ -1489,7 +1492,8 @@ async def resume_interrupted_workers(
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
                 failed.append(feature_id)
                 continue
-            cost_tracker.record("evaluator", eval_result.get("cost", 0), **_metrics_from(eval_result))
+            cost_tracker.record("evaluator", eval_result.get("cost", 0),
+                                phase="evaluator-resume", **_metrics_from(eval_result))
 
             if "VERDICT: FAIL" in eval_result.get("output", ""):
                 # Feedback stays in worktree for retry gen; also persist for crash recovery
@@ -1572,7 +1576,7 @@ async def run_harness(
     state_dir = state_mgr.state_dir
 
     cb = CircuitBreaker(state_dir, config.get("circuit_breaker", {}))
-    cost_tracker = CostTracker()
+    cost_tracker = CostTracker(log_path=state_dir / "token_log.jsonl")
     prompts_dir = Path(__file__).parent.parent / "prompts"
 
     cp = ControlPlaneClient(state_dir=state_dir)
@@ -1618,6 +1622,7 @@ async def run_harness(
     # Resume from previous run
     if resume and state["phase"] != "init":
         cost_tracker = CostTracker.from_dict(state.get("cost_breakdown", {}))
+        cost_tracker.log_path = state_dir / "token_log.jsonl"
         print(f"Resuming run {active_run_id} from phase: {state['phase']}, iteration: {state['iteration']}")
         # Reset stale state — current_feature_id reflects the last killed session,
         # not what will actually run next. Clear drain state if resuming after drain.
@@ -1718,7 +1723,8 @@ async def run_harness(
                 system_prompt="You are a product architect designing a comprehensive application specification.",
             )
             result = await run_agent_session(planner_prompt, planner_options, project_dir, progress_label="Planner")
-            cost_tracker.record("planner", result["cost"], **_metrics_from(result))
+            cost_tracker.record("planner", result["cost"],
+                                phase="planner", **_metrics_from(result))
             print(f"  [Planner] complete. Cost: ${result['cost']:.2f}")
             use_work_plan = False
 
@@ -1752,7 +1758,8 @@ async def run_harness(
                     + "3. Write a non-empty feature_list.json\n"
                 ).replace("{{STATE_DIR}}", str(state_dir))
                 result2 = await run_agent_session(retry_prompt, planner_options, project_dir)
-                cost_tracker.record("planner", result2["cost"], **_metrics_from(result2))
+                cost_tracker.record("planner", result2["cost"],
+                                    phase="planner-retry", **_metrics_from(result2))
                 validation2 = validate_planner_output(state_dir, use_work_plan=False)
                 if not validation2["valid"]:
                     print(f"  Planner still invalid after retry: {validation2['reason']}")
@@ -2048,7 +2055,8 @@ async def run_harness(
         gen_options = create_client_options(project_dir, config)
 
         gen_result = await run_agent_session(gen_user_msg, gen_options, project_dir, system_prompt=gen_system)
-        cost_tracker.record("generator", gen_result["cost"], **_metrics_from(gen_result))
+        cost_tracker.record("generator", gen_result["cost"],
+                            phase="generator-seq", **_metrics_from(gen_result))
         cost_tracker.record_feature(feature_id, "generator", gen_result["cost"])
 
         # Write discovery brief + shared knowledge
@@ -2159,7 +2167,8 @@ async def run_harness(
             eval_options = create_client_options(project_dir, config)
 
             eval_result = await run_agent_session(eval_user_msg, eval_options, project_dir, system_prompt=eval_system)
-            cost_tracker.record("evaluator", eval_result["cost"], **_metrics_from(eval_result))
+            cost_tracker.record("evaluator", eval_result["cost"],
+                                phase="evaluator-seq", **_metrics_from(eval_result))
             cost_tracker.record_feature(feature_id, "evaluator", eval_result["cost"])
 
             state_mgr.update_state(

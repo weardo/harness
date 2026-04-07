@@ -1,5 +1,7 @@
 """Tests for cost_tracker.py."""
 
+import json
+
 from src.core.cost_tracker import CostTracker
 
 
@@ -151,3 +153,75 @@ class TestPerFeatureCosts:
         ct.record("generator", 10.0)
         summary = ct.format_summary()
         assert "Per-feature" not in summary
+
+
+class TestCostTrackerLog:
+    def test_record_without_log_path_does_not_write(self, tmp_path):
+        tracker = CostTracker()  # no log_path
+        tracker.record("generator", 0.12, usage={"input_tokens": 100, "output_tokens": 50})
+        # No file should have been created anywhere in tmp_path
+        assert list(tmp_path.iterdir()) == []
+
+    def test_record_with_log_path_appends_jsonl(self, tmp_path):
+        log = tmp_path / "token_log.jsonl"
+        tracker = CostTracker(log_path=log)
+        tracker.record(
+            "generator", 0.12,
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 10,
+            },
+            duration_ms=1234,
+            num_turns=5,
+            phase="generator-first",
+        )
+        tracker.record(
+            "evaluator", 0.05,
+            usage={"input_tokens": 80, "output_tokens": 20},
+            phase="evaluator",
+        )
+
+        lines = log.read_text().strip().split("\n")
+        assert len(lines) == 2
+
+        e1 = json.loads(lines[0])
+        assert e1["agent"] == "generator"
+        assert e1["phase"] == "generator-first"
+        assert e1["cost_usd"] == 0.12
+        assert e1["input_tokens"] == 100
+        assert e1["output_tokens"] == 50
+        assert e1["cache_read"] == 200
+        assert e1["cache_creation"] == 10
+        assert e1["duration_ms"] == 1234
+        assert e1["turns"] == 5
+        assert "ts" in e1
+
+        e2 = json.loads(lines[1])
+        assert e2["agent"] == "evaluator"
+        assert e2["phase"] == "evaluator"
+        assert e2["cache_read"] == 0
+        assert e2["cache_creation"] == 0
+
+    def test_record_phase_defaults_to_empty(self, tmp_path):
+        log = tmp_path / "token_log.jsonl"
+        tracker = CostTracker(log_path=log)
+        tracker.record("planner", 0.30, usage={"input_tokens": 1000, "output_tokens": 200})
+        entry = json.loads(log.read_text().strip())
+        assert entry["phase"] == ""
+
+    def test_from_dict_requires_log_path_reattach(self, tmp_path):
+        log = tmp_path / "token_log.jsonl"
+        src = CostTracker(log_path=log)
+        src.record("generator", 0.1, usage={"input_tokens": 10, "output_tokens": 5})
+        data = src.to_dict()
+
+        # from_dict does NOT know about log_path — caller must re-attach
+        restored = CostTracker.from_dict(data)
+        assert restored.log_path is None
+
+        # But re-attaching works and continues appending
+        restored.log_path = log
+        restored.record("evaluator", 0.05, usage={"input_tokens": 8, "output_tokens": 2})
+        assert len(log.read_text().strip().split("\n")) == 2

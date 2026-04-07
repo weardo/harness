@@ -3,9 +3,13 @@ Cost Tracker — Per-Agent Cost Accumulation
 ============================================
 
 Tracks costs from SDK ResultMessage per agent type (planner, generator, evaluator).
+Optionally appends a JSONL log of every record() call for offline token analysis.
 """
 
+import json
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 
@@ -23,8 +27,42 @@ class CostTracker:
     total_duration_ms: int = 0
     total_api_ms: int = 0
     total_turns: int = 0
+    log_path: Optional[Path] = None  # if set, each record() appends a JSONL line here
     _session_costs: list = field(default_factory=list)
     _feature_costs: dict = field(default_factory=dict)
+
+    def _append_log(
+        self,
+        agent_type: str,
+        phase: str,
+        cost_usd: float,
+        usage: Optional[dict],
+        duration_ms: int,
+        num_turns: int,
+    ) -> None:
+        """Append one JSONL entry to log_path. Silent on I/O errors —
+        telemetry must never break a run."""
+        if self.log_path is None:
+            return
+        usage = usage or {}
+        entry = {
+            "ts": time.time(),
+            "agent": agent_type,
+            "phase": phase,
+            "cost_usd": cost_usd,
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read": usage.get("cache_read_input_tokens", 0),
+            "cache_creation": usage.get("cache_creation_input_tokens", 0),
+            "duration_ms": duration_ms,
+            "turns": num_turns,
+        }
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
 
     @property
     def total(self) -> float:
@@ -36,8 +74,14 @@ class CostTracker:
         return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
 
     def record(self, agent_type: str, cost_usd: float, usage: Optional[dict] = None,
-               duration_ms: int = 0, duration_api_ms: int = 0, num_turns: int = 0) -> None:
-        """Record cost, tokens, and timing for an agent session."""
+               duration_ms: int = 0, duration_api_ms: int = 0, num_turns: int = 0,
+               phase: str = "") -> None:
+        """Record cost, tokens, and timing for an agent session.
+
+        phase: optional sub-category label (e.g. "generator-retry-2", "planner-architect",
+               "evaluator-resume"). Written to the JSONL log if log_path is set. Default
+               empty keeps existing call sites working untouched.
+        """
         if agent_type == "planner":
             self.planner += cost_usd
         elif agent_type == "generator":
@@ -60,7 +104,10 @@ class CostTracker:
             "usage": usage,
             "duration_ms": duration_ms,
             "num_turns": num_turns,
+            "phase": phase,
         })
+
+        self._append_log(agent_type, phase, cost_usd, usage, duration_ms, num_turns)
 
     def record_feature(self, feature_id: str, agent_type: str, cost_usd: float) -> None:
         """Accumulate cost for a specific feature."""
