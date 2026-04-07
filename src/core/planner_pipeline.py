@@ -445,7 +445,8 @@ async def _run_refiner_fix(
                         usage=fix_result.get("usage") or {},
                         duration_ms=fix_result.get("duration_ms", 0),
                         duration_api_ms=fix_result.get("duration_api_ms", 0),
-                        num_turns=fix_result.get("num_turns", 0))
+                        num_turns=fix_result.get("num_turns", 0),
+                        phase="planner-refiner-fix")
 
     state_mgr.complete_role(
         "refiner-fix",
@@ -582,7 +583,8 @@ async def run_planner_pipeline(  # noqa: C901
                             usage=result_usage,
                             duration_ms=sdk_duration_ms,
                             duration_api_ms=result.get("duration_api_ms", 0),
-                            num_turns=result.get("num_turns", 0))
+                            num_turns=result.get("num_turns", 0),
+                            phase=f"planner-{role_name}")
 
         print(f"  {role_name}: complete. Cost: ${cost:.2f}. Artifact: {artifact}")
         _write_planner_log(state_dir, "role_complete",
@@ -636,7 +638,8 @@ async def run_planner_pipeline(  # noqa: C901
                                 usage=retry_result.get("usage") or {},
                                 duration_ms=retry_result.get("duration_ms", 0),
                                 duration_api_ms=retry_result.get("duration_api_ms", 0),
-                                num_turns=retry_result.get("num_turns", 0))
+                                num_turns=retry_result.get("num_turns", 0),
+                                phase=f"planner-{role_name}-retry")
 
             retry_validation = _validate_artifact(role, state_dir)
             if retry_validation.get("valid"):
