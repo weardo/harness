@@ -265,11 +265,61 @@ def create_worktree(project_dir: Path, worker_id: int, base_branch: str = "HEAD"
     # Without --reference, git clones each submodule from remote per worktree.
     _init_submodules_local(project_dir, worktree_dir)
 
+    # Copy .env* files from the parent project's submodules into the worktree.
+    # .env files are git-ignored by convention, so `git worktree add` never
+    # brings them along. Without this step, agents running integration tests
+    # inside the worktree hit "dial tcp [::1]:5432: connection refused" because
+    # they have no DB host/port config.
+    _copy_env_files(project_dir, worktree_dir)
+
     # Regenerate and link the local SDK so admin-ui tasks have up-to-date
     # connector types without needing to run `make sdk` manually.
     _link_local_sdk(project_dir, worktree_dir)
 
     return worktree_dir, branch_name
+
+
+def _copy_env_files(project_dir: Path, worktree_dir: Path) -> None:
+    """Copy `.env*` files from the parent project's submodules into the
+    corresponding worktree submodules.
+
+    Runs after `_init_submodules_local` so submodule directories exist. Uses
+    a conservative allow-list of repos known to need DB/service credentials:
+    `go-backend`, `go-worker`, `go-consumer`. Missing directories are silently
+    skipped (project may not use monorepo layout).
+
+    Copies:
+      - .env           (current active profile, written by `make use-local`)
+      - .env.local     (dev profile with Docker ports — source of truth for
+                       tests that need Postgres/Mongo/Redis/Temporal)
+      - .env.test      (if present — some repos separate test config)
+
+    Does NOT copy `.env.stage` / `.env.production` — those point to remote
+    infra and running tests against them from a worker is unsafe.
+    """
+    import shutil
+    SUBMODULES = ("go-backend", "go-worker", "go-consumer")
+    ENV_FILES = (".env", ".env.local", ".env.test")
+
+    copied = 0
+    for sm in SUBMODULES:
+        src_dir = project_dir / sm
+        dst_dir = worktree_dir / sm
+        if not src_dir.is_dir() or not dst_dir.is_dir():
+            continue
+        for name in ENV_FILES:
+            src = src_dir / name
+            if not src.is_file():
+                continue
+            dst = dst_dir / name
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except OSError as e:
+                print(f"  ⚠️  Failed to copy {sm}/{name} into {worktree_dir.name}: {e}")
+
+    if copied:
+        print(f"  🔑 Copied {copied} env file(s) into {worktree_dir.name}")
 
 
 def _link_local_sdk(project_dir: Path, worktree_dir: Path) -> None:
