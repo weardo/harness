@@ -26,6 +26,7 @@ from .work_plan import WorkPlan
 from .event_tracker import EventTracker
 from .parallel import (
     group_by_dependency, create_worktree, merge_worktree, cleanup_worktree,
+    get_resolver_config,
     branch_has_commits, _init_submodules_local, write_task_brief,
 )
 from .coordination import (
@@ -663,6 +664,22 @@ async def run_parallel_wave(
     parallel_features = [f for f in layer if f.get("scope")]
     sequential_features = [f for f in layer if not f.get("scope")]
 
+    # Filter out features that have a merge_failed worker. Those are handled
+    # exclusively by resume_interrupted_workers' merge-retry path — we must
+    # NOT dispatch a fresh agent on them (that would waste eval+gen tokens on
+    # code that's already approved; only the merge step failed).
+    _wa_snapshot = worker_assignments.load_assignments(state_dir)
+    _merge_failed_features = {
+        a.get("feature_id")
+        for a in _wa_snapshot.get("assignments", {}).values()
+        if a.get("status") == "merge_failed"
+    }
+    if _merge_failed_features:
+        parallel_features = [
+            f for f in parallel_features if f["id"] not in _merge_failed_features
+        ]
+        print(f"  Pool: skipping {len(_merge_failed_features)} feature(s) with merge_failed workers")
+
     completed, failed, conflicts = [], [], []
 
     for feat in sequential_features:
@@ -787,6 +804,10 @@ async def run_parallel_wave(
         try:
             _wa = json_mod.loads(_wa_path.read_text())
             for _wid, _asgn in _wa.get("assignments", {}).items():
+                # Only reuse eval-failed worktrees. merge_failed workers are
+                # handled exclusively by resume_interrupted_workers' merge-retry
+                # path — never re-dispatched through the pool (that would waste
+                # an eval+gen cycle on code that's already approved).
                 if _asgn.get("feature_id") == feature_id and _asgn.get("status") == "failed":
                     _wt_path = Path(_asgn.get("worktree_dir", ""))
                     _br = _asgn.get("branch", "")
@@ -869,6 +890,7 @@ async def run_parallel_wave(
 
             # If we have a prior generator session ID, resume it with eval feedback
             # instead of starting fresh — agent keeps full context from prior run.
+            worker_assignments.update_assignment_live_state(state_dir, wid, "gen-running")
             if _resume_sid:
                 user_msg = (
                     f"The evaluator reviewed your work on {feature_id} and found issues. "
@@ -888,6 +910,7 @@ async def run_parallel_wave(
                     _timeout_sid = _resume_sid
                     if _timeout_sid:
                         worker_assignments.update_assignment_session_id(state_dir, wid, _timeout_sid)
+                    worker_assignments.update_assignment_live_state(state_dir, wid, "gen-timeout")
                     await result_queue.put(("result", feature_id, {
                         "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
                         "branch": branch, "wid": wid,
@@ -904,6 +927,7 @@ async def run_parallel_wave(
                     )
                 except asyncio.TimeoutError:
                     print(f"  Generator {agent_id} on {feature_id}: timed out after {timeout_minutes}m")
+                    worker_assignments.update_assignment_live_state(state_dir, wid, "gen-timeout")
                     await result_queue.put(("result", feature_id, {
                         "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
                         "branch": branch, "wid": wid,
@@ -919,6 +943,7 @@ async def run_parallel_wave(
                 # Resume was attempted but no session_id came back (session expired/missing).
                 # Clear the stale ID so next retry falls back to a fresh session.
                 worker_assignments.update_assignment_session_id(state_dir, wid, "")
+            worker_assignments.update_assignment_live_state(state_dir, wid, "gen-done")
 
             output = gen_result.get("output", "")
             gen_status = "ok"
@@ -934,6 +959,7 @@ async def run_parallel_wave(
 
             should_qa = gen_status == "ok" or branch_has_commits(project_dir, branch)
             if not should_qa:
+                worker_assignments.update_assignment_live_state(state_dir, wid, "gen-failed-no-commits")
                 await result_queue.put(("result", feature_id, {
                     "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
                     "branch": branch, "wid": wid,
@@ -946,6 +972,7 @@ async def run_parallel_wave(
 
             # --- QA (own timeout) ---
             worker_assignments.update_assignment_phase(state_dir, wid, "evaluator")
+            worker_assignments.update_assignment_live_state(state_dir, wid, "eval-running")
             print(f"  QA {feature_id} in worktree")
             qa_user_msg = _build_qa_user_msg(feature_id, work_plan)
             qa_options = create_client_options(wt_dir, config)
@@ -954,14 +981,20 @@ async def run_parallel_wave(
                     run_agent_session(qa_user_msg, qa_options, wt_dir, system_prompt=qa_system_prompt),
                     timeout=qa_timeout,
                 )
+                _eval_terminal = "eval-done"
             except asyncio.TimeoutError:
                 print(f"  QA {feature_id}: timed out after 15m")
                 qa_result = {"output": "[QA timed out]", "cost": 0}
+                _eval_terminal = "eval-timeout"
 
             # Persist evaluator session ID for crash recovery
             _eval_sid = qa_result.get("session_id")
             if _eval_sid:
                 worker_assignments.update_assignment_session_id(state_dir, wid, _eval_sid, phase="evaluator")
+
+            # Eval has finished — record before queueing result so observers see truth
+            # even if outer-loop result processing is backlogged behind a slow merge.
+            worker_assignments.update_assignment_live_state(state_dir, wid, _eval_terminal)
 
             await result_queue.put(("result", feature_id, {
                 "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
@@ -1055,6 +1088,7 @@ async def run_parallel_wave(
             # Only force-delete if no commits — preserve worktrees with prior work
             if branch_has_commits(project_dir, branch):
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "gen-failed-with-commits")
                 print(f"  {feature_id}: gen failed but worktree has commits — preserving")
             else:
                 cleanup_worktree(project_dir, wt_dir, branch, force=True)
@@ -1109,6 +1143,7 @@ async def run_parallel_wave(
             if attempt < max_retries:
                 # Keep worktree — mark assignment as failed so _find_reusable_worktree picks it up
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "eval-failed-retrying")
                 print(f"  {feature_id}: QA FAIL ({attempt}/{max_retries}) -- retrying in same worktree")
                 fleet_session.requeue_feature(session, feature_id, reason="eval_fail")
                 total += 1
@@ -1117,6 +1152,7 @@ async def run_parallel_wave(
                 print(f"  {feature_id}: QA FAIL ({attempt}/{max_retries}) -- BLOCKED (worktree preserved)")
                 # Never destroy worktree with commits — it can be recovered manually or on next resume
                 worker_assignments.update_assignment_status(state_dir, wid, "blocked")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "eval-failed-blocked")
                 failed.append(feature_id)
                 if work_plan is not None:
                     work_plan.mark_task_blocked(feature_id, "max_retries_exceeded", work_plan_path)
@@ -1124,7 +1160,12 @@ async def run_parallel_wave(
             continue
 
         # QA passed -- safe to merge
-        merge_result = merge_worktree(project_dir, branch)
+        worker_assignments.update_assignment_live_state(state_dir, wid, "merging")
+        _enable_llm, _llm_model = get_resolver_config(config)
+        merge_result = merge_worktree(
+            project_dir, branch,
+            enable_llm_resolver=_enable_llm, llm_model=_llm_model,
+        )
         unregister_instance(agent_id, state_dir)
 
         if not merge_result["success"]:
@@ -1134,14 +1175,19 @@ async def run_parallel_wave(
                 fleet_session.requeue_feature(session, feature_id, reason="conflict")
                 conflicts.append(feature_id)
                 fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "conflict")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merge-conflict")
             else:
                 failed.append(feature_id)
                 fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "merge_error")
-            worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merge-failed")
+            # Use merge_failed (not "failed") so recovery takes the merge-retry
+            # path instead of dispatching a fresh evaluator/generator.
+            worker_assignments.update_assignment_status(state_dir, wid, "merge_failed")
             fleet_session.save_session(session, state_dir)
             continue
 
         # Merge succeeded — NOW safe to cleanup worktree
+        worker_assignments.update_assignment_live_state(state_dir, wid, "merge-success")
         cleanup_worktree(project_dir, wt_dir, branch, force=True)
         worker_assignments.remove_assignment(state_dir, wid)
         await state_mgr.mark_feature_passing_async(feature_id)
@@ -1271,7 +1317,8 @@ async def resume_interrupted_workers(
 
     completed, failed = [], []
     dispatched = []
-    _pending_evals = []  # (wid, assignment, wt_dir, branch, feature_id)
+    _pending_evals = []   # (wid, assignment, wt_dir, branch, feature_id) — need re-evaluation
+    _merge_retry = []     # (wid, assignment, wt_dir, branch, feature_id) — only need merge retry
     _needs_dispatch = set()  # wids that need recovery generator
 
     for wid, assignment in resumable.items():
@@ -1320,6 +1367,14 @@ async def resume_interrupted_workers(
         _phase = assignment.get("phase", "generator")
         _gen_sid = assignment.get("gen_session_id") or None
         _eval_sid = assignment.get("eval_session_id") or None
+        _status = assignment.get("status", "")
+
+        # merge_failed workers: eval already passed, only the merge itself failed.
+        # Skip the full eval cycle — just retry the merge. This saves ~$1-3 per worker
+        # vs re-running evaluator + generator unnecessarily.
+        if _status == "merge_failed" and br_has_commits:
+            _merge_retry.append((wid, assignment, wt_dir, branch, feature_id))
+            continue
 
         if _phase == "evaluator" and br_has_commits:
             # Evaluator was running or finished — re-evaluate to determine pass/fail
@@ -1327,18 +1382,64 @@ async def resume_interrupted_workers(
             continue
 
         # Failed workers with commits: collect for parallel evaluation below.
-        if assignment.get("status") == "failed" and br_has_commits:
+        if _status == "failed" and br_has_commits:
             _pending_evals.append((wid, assignment, wt_dir, branch, feature_id))
             continue
 
         # Status is "running" or "interrupted" in generator phase — needs recovery generator
         _needs_dispatch.add(wid)
 
+    # --- Merge-retry-only loop (no evaluator, no generator) ---
+    # For workers where eval already passed but merge failed: just retry the merge.
+    # If the merge still fails (e.g., unresolvable conflicts), mark as blocked so
+    # human intervention is required — do NOT fall back to running another eval.
+    if _merge_retry:
+        print(f"  Merge-retry {len(_merge_retry)} worker(s) whose eval already passed...")
+        for wid, assignment, wt_dir, branch, feature_id in _merge_retry:
+            worker_assignments.update_assignment_live_state(state_dir, wid, "merging")
+            _enable_llm, _llm_model = get_resolver_config(config)
+            merge_result = merge_worktree(
+                project_dir, branch,
+                enable_llm_resolver=_enable_llm, llm_model=_llm_model,
+            )
+            if merge_result["success"]:
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merge-success")
+                cleanup_worktree(project_dir, wt_dir, branch, force=True)
+                worker_assignments.remove_assignment(state_dir, wid)
+                await state_mgr.mark_feature_passing_async(feature_id)
+                if work_plan is not None:
+                    work_plan.mark_task_done(feature_id, work_plan_path)
+                    work_plan.sync_feature_list(state_dir / "feature_list.json")
+                completed.append(feature_id)
+                print(f"  Merge-retry {feature_id}: ✓ merged")
+                _cur = state_mgr.load_state()
+                await state_mgr.update_state_async(
+                    phase="generator",
+                    current_feature_id=feature_id,
+                    iteration=_cur.get("iteration", 0) + 1,
+                    generator_sessions=_cur.get("generator_sessions", 0) + 1,
+                    total_cost_usd=cost_tracker.total,
+                    cost_breakdown=cost_tracker.to_dict(),
+                    last_updated=datetime.now(timezone.utc).isoformat(),
+                )
+            else:
+                # Still failed — keep as merge_failed, will retry next resume.
+                # Do NOT dispatch a generator — the code is already approved.
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merge-failed")
+                print(f"  Merge-retry {feature_id}: ✗ still failing — {merge_result.get('error','')[:80]}")
+                failed.append(feature_id)
+
     # --- Parallel evaluation of failed worktrees ---
     if _pending_evals:
         print(f"  Evaluating {len(_pending_evals)} failed worktree(s) in parallel...")
         test_command = config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'")
         timeout_mins = config.get("parallel", {}).get("agent_timeout_minutes", 30)
+
+        # Mark all pending workers as eval-running BEFORE dispatch so observers
+        # see real-time state instead of stale "phase=evaluator status=running"
+        # left over from a prior crashed orchestrator.
+        for _wid, _a, _wt, _br, _fid in _pending_evals:
+            worker_assignments.update_assignment_live_state(state_dir, _wid, "eval-running")
 
         async def _eval_one(wid, assignment, wt_dir, branch, feature_id):
             eval_repl, eval_file, eval_fallback, eval_user_msg = _build_eval_replacements(
@@ -1351,8 +1452,13 @@ async def resume_interrupted_workers(
                     run_agent_session(eval_user_msg, eval_options, wt_dir, system_prompt=eval_system),
                     timeout=15 * 60,
                 )
+                _terminal = "eval-done"
             except asyncio.TimeoutError:
                 result = {"output": "[eval timed out]", "cost": 0}
+                _terminal = "eval-timeout"
+            # Record terminal state immediately so the JSON reflects truth
+            # even if the result-processing loop is backlogged.
+            worker_assignments.update_assignment_live_state(state_dir, wid, _terminal)
             return wid, assignment, wt_dir, branch, feature_id, result
 
         eval_tasks = [
@@ -1371,8 +1477,14 @@ async def resume_interrupted_workers(
 
             if "VERDICT: FAIL" not in eval_result.get("output", ""):
                 # Passed — merge sequentially (touches main)
-                merge_result = merge_worktree(project_dir, branch)
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merging")
+                _enable_llm, _llm_model = get_resolver_config(config)
+                merge_result = merge_worktree(
+                    project_dir, branch,
+                    enable_llm_resolver=_enable_llm, llm_model=_llm_model,
+                )
                 if merge_result["success"]:
+                    worker_assignments.update_assignment_live_state(state_dir, wid, "merge-success")
                     cleanup_worktree(project_dir, wt_dir, branch, force=True)
                     worker_assignments.remove_assignment(state_dir, wid)
                     await state_mgr.mark_feature_passing_async(feature_id)
@@ -1392,6 +1504,10 @@ async def resume_interrupted_workers(
                         last_updated=datetime.now(timezone.utc).isoformat(),
                     )
                 else:
+                    # Use merge_failed status so the next resume takes the
+                    # merge-retry path (no new eval/gen — code is already approved).
+                    worker_assignments.update_assignment_status(state_dir, wid, "merge_failed")
+                    worker_assignments.update_assignment_live_state(state_dir, wid, "merge-failed")
                     print(f"  Resume {feature_id}: merge failed — {merge_result.get('error', '')[:100]}")
                     failed.append(feature_id)
                 continue
@@ -1403,6 +1519,7 @@ async def resume_interrupted_workers(
                 shutil.copy2(_wt_fb, state_dir / f"feedback-{feature_id}.md")
             print(f"  Resume {feature_id}: evaluator FAILED — dispatching recovery generator")
             worker_assignments.update_assignment_status(state_dir, wid, "running")
+            worker_assignments.update_assignment_live_state(state_dir, wid, "eval-failed-recovering")
             _needs_dispatch.add(wid)
 
     # --- Dispatch recovery generators ---
@@ -1475,6 +1592,7 @@ async def resume_interrupted_workers(
         # Update assignment status
         agent_id = generate_instance_id()
         worker_assignments.update_assignment_status(state_dir, wid, "running")
+        worker_assignments.update_assignment_live_state(state_dir, wid, "gen-running")
 
         gen_options = create_client_options(wt_dir, config)
         dispatched.append((agent_id, feature_id, wt_dir, branch, wid, user_msg, gen_system, gen_options, _resume_sid))
@@ -1509,11 +1627,17 @@ async def resume_interrupted_workers(
                 # Agent failed AND produced no commits — nothing to salvage
                 print(f"  Resumed agent on {feature_id}: failed (no status block, no commits)")
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "gen-failed-no-commits")
                 failed.append(feature_id)
                 continue
 
             if not has_status_block and has_commits:
                 print(f"  Resumed agent on {feature_id}: no status block but has commits — evaluating")
+
+            # Generator phase complete — about to evaluate
+            worker_assignments.update_assignment_live_state(state_dir, wid, "gen-done")
+            worker_assignments.update_assignment_phase(state_dir, wid, "evaluator")
+            worker_assignments.update_assignment_live_state(state_dir, wid, "eval-running")
 
             # Evaluate IN the worktree first — only merge if eval passes
             print(f"  Resumed {feature_id}: running evaluator in worktree")
@@ -1530,8 +1654,11 @@ async def resume_interrupted_workers(
             except asyncio.TimeoutError:
                 print(f"  Resumed {feature_id}: eval timed out (15m) — preserving worktree")
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "eval-timeout")
                 failed.append(feature_id)
                 continue
+            # Eval finished — record before processing verdict so observers see truth
+            worker_assignments.update_assignment_live_state(state_dir, wid, "eval-done")
             cost_tracker.record("evaluator", eval_result.get("cost", 0),
                                 phase="evaluator-resume", **_metrics_from(eval_result))
 
@@ -1547,17 +1674,25 @@ async def resume_interrupted_workers(
                     _wt_fb.write_text(eval_result["output"])
                 # Preserve worktree — pool retry will reuse it
                 worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                worker_assignments.update_assignment_live_state(state_dir, wid, "eval-failed-retrying")
                 print(f"  Resumed {feature_id}: eval FAIL — worktree preserved, returning to pool")
                 failed.append(feature_id)
             else:
                 # Eval passed — now merge
-                merge_result = merge_worktree(project_dir, branch)
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merging")
+                _enable_llm, _llm_model = get_resolver_config(config)
+                merge_result = merge_worktree(
+                    project_dir, branch,
+                    enable_llm_resolver=_enable_llm, llm_model=_llm_model,
+                )
                 if not merge_result["success"]:
                     print(f"  Resumed {feature_id}: eval PASS but merge failed — preserving")
-                    worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                    worker_assignments.update_assignment_status(state_dir, wid, "merge_failed")
+                    worker_assignments.update_assignment_live_state(state_dir, wid, "merge-failed")
                     failed.append(feature_id)
                     continue
 
+                worker_assignments.update_assignment_live_state(state_dir, wid, "merge-success")
                 cleanup_worktree(project_dir, wt_dir, branch, force=True)
                 worker_assignments.remove_assignment(state_dir, wid)
                 await state_mgr.mark_feature_passing_async(feature_id)
@@ -1699,9 +1834,11 @@ async def run_harness(
     print()
 
     # Sweep merged worktrees at run start (feature 040)
+    # Pass state_dir so the sweep can identify orphan worktrees (no assignment)
+    # and clean them even if they have uncommitted changes from a killed orchestrator.
     removed = []
     try:
-        removed_list = sweep_merged_worktrees(project_dir)
+        removed_list = sweep_merged_worktrees(project_dir, state_dir=state_dir)
         removed = removed_list or []
         if removed:
             print(f"  Worktree sweep (start): removed {len(removed)} merged worktree(s)")

@@ -467,7 +467,32 @@ def _rescue_submodule_objects(project_dir: Path, branch_name: str) -> None:
         )
 
 
-def merge_worktree(project_dir: Path, branch_name: str) -> dict:
+def get_resolver_config(config: dict | None) -> tuple[bool, str]:
+    """Read LLM conflict-resolver settings from the harness config.
+
+    Returns (enable_llm_resolver, model). Defaults: enabled, haiku-4-5.
+    Config shape:
+        parallel:
+          auto_resolver:
+            llm_agent: true              # default true
+            llm_agent_model: claude-haiku-4-5
+    """
+    if not config:
+        return True, "claude-haiku-4-5"
+    parallel_cfg = config.get("parallel", {}) or {}
+    resolver_cfg = parallel_cfg.get("auto_resolver", {}) or {}
+    enabled = resolver_cfg.get("llm_agent", True)
+    model = resolver_cfg.get("llm_agent_model", "claude-haiku-4-5")
+    return bool(enabled), str(model)
+
+
+def merge_worktree(
+    project_dir: Path,
+    branch_name: str,
+    *,
+    enable_llm_resolver: bool = True,
+    llm_model: str = "claude-haiku-4-5",
+) -> dict:
     """Merge a worker branch back to the current branch.
 
     Returns {success: bool, conflict: bool, error: str}.
@@ -497,7 +522,11 @@ def merge_worktree(project_dir: Path, branch_name: str) -> dict:
         # Fix: merge the branch's submodule commit into the main submodule,
         # then stage the resolved pointer.
         if "CONFLICT (submodule)" in merged:
-            resolved = _auto_resolve_submodule_conflicts(project_dir, branch_name, merged)
+            resolved = _auto_resolve_submodule_conflicts(
+                project_dir, branch_name, merged,
+                enable_llm_resolver=enable_llm_resolver,
+                llm_model=llm_model,
+            )
             if resolved:
                 # Check if all conflicts are resolved
                 status = subprocess.run(
@@ -532,8 +561,170 @@ def merge_worktree(project_dir: Path, branch_name: str) -> dict:
     }
 
 
+def _try_resolve_json_union(file_path: Path) -> bool:
+    """Resolve a JSON merge conflict by taking the union of keys from both sides.
+
+    Used for additive i18n message JSONs (apps/*/messages/*.json) where two
+    branches add different keys to the same object. If the same key appears
+    on both sides with the same value, the duplicate is dropped. If the same
+    key appears with different values, returns False (manual resolution needed).
+
+    Returns True if the file is now valid JSON with no conflict markers.
+    """
+    import json
+    import re
+    try:
+        text = file_path.read_text()
+    except OSError:
+        return False
+    if "<<<<<<< " not in text:
+        return True  # nothing to resolve
+
+    MARKER_HEAD = "<<<<<<< "
+    MARKER_SEP = "======="
+    MARKER_END = ">>>>>>> "
+    key_re = re.compile(r'\s*"([^"]+)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,]+?)\s*,?\s*$')
+
+    def parse_kv(line: str):
+        m = key_re.match(line)
+        if m:
+            return m.group(1), m.group(2).rstrip(',').rstrip()
+        return None, None
+
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(MARKER_HEAD):
+            head_block: list[str] = []
+            i += 1
+            while i < len(lines) and lines[i] != MARKER_SEP:
+                head_block.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                return False
+            i += 1  # skip ======
+            other_block: list[str] = []
+            while i < len(lines) and not lines[i].startswith(MARKER_END):
+                other_block.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                return False
+            i += 1  # skip >>>>>>>
+
+            head_kv: dict = {}
+            for ln in head_block:
+                k, v = parse_kv(ln)
+                if k:
+                    head_kv[k] = v
+
+            filtered_other: list[str] = []
+            for ln in other_block:
+                k, v = parse_kv(ln)
+                if k and k in head_kv:
+                    if v == head_kv[k]:
+                        continue  # identical duplicate — drop
+                    else:
+                        return False  # value conflict — manual resolution
+                filtered_other.append(ln)
+
+            if head_block:
+                last = head_block[-1].rstrip()
+                if not last.endswith(','):
+                    if last.endswith('"') or last.endswith('}') or re.search(r'[0-9]$|true$|false$|null$', last):
+                        head_block[-1] = last + ","
+                out.extend(head_block)
+                if not filtered_other and out and out[-1].rstrip().endswith(','):
+                    out[-1] = out[-1].rstrip()[:-1]
+                out.extend(filtered_other)
+            else:
+                out.extend(filtered_other)
+        else:
+            out.append(line)
+            i += 1
+
+    new_text = "\n".join(out)
+    try:
+        json.loads(new_text)
+    except Exception:
+        return False
+    file_path.write_text(new_text)
+    return True
+
+
+def _try_auto_resolve_inner_conflicts(
+    submodule_dir: Path,
+    *,
+    enable_llm: bool = True,
+    llm_model: str = "claude-haiku-4-5",
+) -> bool:
+    """Try to auto-resolve file-level conflicts left after `git merge` inside
+    a submodule.
+
+    Tier 1 (mechanical): JSON key union for additive i18n messages.
+    Tier 2 (LLM):       Haiku conflict resolver for everything else (enable_llm).
+
+    Returns True if ALL conflicted files are resolved, False otherwise.
+    """
+    status = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=submodule_dir, capture_output=True, text=True,
+    )
+    conflict_files = [
+        f.strip() for f in status.stdout.splitlines() if f.strip()
+    ]
+    if not conflict_files:
+        return True  # nothing to resolve
+
+    # --- Tier 1: mechanical rules -------------------------------------------
+    remaining: list[str] = []
+    for rel in conflict_files:
+        f = submodule_dir / rel
+        if "/messages/" in rel and rel.endswith(".json"):
+            if _try_resolve_json_union(f):
+                subprocess.run(
+                    ["git", "add", rel],
+                    cwd=submodule_dir, capture_output=True, text=True,
+                )
+                continue
+        remaining.append(rel)
+
+    if not remaining:
+        return True
+
+    if not enable_llm:
+        return False
+
+    # --- Tier 2: LLM resolver ------------------------------------------------
+    try:
+        from .conflict_resolver import try_llm_resolve_conflicts
+    except ImportError:
+        return False
+
+    try:
+        resolved, unresolved = try_llm_resolve_conflicts(
+            submodule_dir, remaining, model=llm_model,
+        )
+    except Exception:
+        return False
+
+    for rel in resolved:
+        subprocess.run(
+            ["git", "add", rel],
+            cwd=submodule_dir, capture_output=True, text=True,
+        )
+
+    return not unresolved
+
+
 def _auto_resolve_submodule_conflicts(
-    project_dir: Path, branch_name: str, merge_output: str,
+    project_dir: Path,
+    branch_name: str,
+    merge_output: str,
+    *,
+    enable_llm_resolver: bool = True,
+    llm_model: str = "claude-haiku-4-5",
 ) -> bool:
     """Auto-resolve submodule merge conflicts by merging inside each submodule.
 
@@ -541,7 +732,8 @@ def _auto_resolve_submodule_conflicts(
     can't auto-merge. The fix is:
     1. Find the branch's submodule commit from the merge tree
     2. Merge it into the submodule (which is at main's pointer)
-    3. Stage the resolved submodule pointer in the meta-repo
+    3. Resolve any inner file conflicts via known patterns (JSON union)
+    4. Stage the resolved submodule pointer in the meta-repo
 
     Returns True if all submodule conflicts were resolved.
     """
@@ -577,27 +769,46 @@ def _auto_resolve_submodule_conflicts(
 
         # Merge the branch's commit into the submodule
         merge_result = subprocess.run(
-            ["git", "merge", branch_commit, "--no-edit"],
+            ["git", "merge", "--no-ff", branch_commit, "--no-edit"],
             cwd=sm_dir, capture_output=True, text=True,
         )
 
         if merge_result.returncode != 0:
-            # Try rebase as fallback for fast-forward cases
-            subprocess.run(
-                ["git", "merge", "--abort"], cwd=sm_dir,
-                capture_output=True, text=True,
-            )
-            # Check if branch commit is ancestor (already merged)
-            ancestor_check = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", branch_commit, "HEAD"],
-                cwd=sm_dir, capture_output=True, text=True,
-            )
-            if ancestor_check.returncode != 0:
-                # Real conflict inside submodule — can't auto-resolve
-                all_resolved = False
-                continue
+            # Inner merge produced conflicts — try auto-resolving known patterns
+            # (Tier 1: JSON union) then fall back to the LLM resolver (Tier 2).
+            if _try_auto_resolve_inner_conflicts(
+                sm_dir, enable_llm=enable_llm_resolver, llm_model=llm_model,
+            ):
+                # Commit the resolved merge inside the submodule
+                commit_result = subprocess.run(
+                    ["git", "commit", "--no-verify", "--no-edit"],
+                    cwd=sm_dir, capture_output=True, text=True,
+                )
+                if commit_result.returncode != 0:
+                    # Could not commit even after resolution — abort
+                    subprocess.run(
+                        ["git", "merge", "--abort"], cwd=sm_dir,
+                        capture_output=True, text=True,
+                    )
+                    all_resolved = False
+                    continue
+            else:
+                # Could not auto-resolve all inner conflicts — abort and check
+                # whether the branch commit is already an ancestor (no-op merge).
+                subprocess.run(
+                    ["git", "merge", "--abort"], cwd=sm_dir,
+                    capture_output=True, text=True,
+                )
+                ancestor_check = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", branch_commit, "HEAD"],
+                    cwd=sm_dir, capture_output=True, text=True,
+                )
+                if ancestor_check.returncode != 0:
+                    # Real conflict inside submodule — can't auto-resolve
+                    all_resolved = False
+                    continue
 
-        # Stage the resolved submodule in the meta-repo
+        # Stage the resolved submodule pointer in the meta-repo
         subprocess.run(
             ["git", "add", sm_name],
             cwd=project_dir, capture_output=True, text=True,
