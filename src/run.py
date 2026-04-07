@@ -132,16 +132,31 @@ def main():
     if args.planner_model:
         overrides["planner_model"] = args.planner_model
 
-    # Auto-detect control plane if env var not set
+    # Load .env from project dir (stdlib-only, no dotenv dependency)
     import os
+    env_path = project_dir / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip().lstrip("export ")
+                value = value.strip().strip("'\"")
+                if key and not os.environ.get(key):
+                    os.environ[key] = value
+
+    # Auto-detect control plane: .env > probe localhost
     if not os.environ.get("HARNESS_CONTROL_PLANE_URL"):
         try:
             import urllib.request
             urllib.request.urlopen("http://localhost:7842/api/v1/projects", timeout=2)
             os.environ["HARNESS_CONTROL_PLANE_URL"] = "http://localhost:7842"
-            print("  Control plane detected at localhost:7842")
         except Exception:
             pass
+    if os.environ.get("HARNESS_CONTROL_PLANE_URL"):
+        print(f"  Control plane: {os.environ['HARNESS_CONTROL_PLANE_URL']}")
 
     # Run
     try:
@@ -171,8 +186,33 @@ def main():
         print("\nInterrupted. Resume with: python run.py --resume")
         sys.exit(130)
     except Exception as e:
-        print(f"\nError: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        print(f"\nFatal error: {e}")
+        print(tb)
         print("Resume with: python run.py --resume")
+        # Write to unified run.jsonl if state_dir can be inferred
+        try:
+            import json as _json
+            from datetime import datetime, timezone
+            runs_dir = project_dir / ".harness" / "runs"
+            if runs_dir.exists():
+                latest = sorted(runs_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+                if latest:
+                    log_dir = latest[0] / "logs"
+                    log_dir.mkdir(exist_ok=True)
+                    entry = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "event": "error",
+                        "context": "run_harness_fatal",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "traceback": tb,
+                    }
+                    with open(log_dir / "run.jsonl", "a") as f:
+                        f.write(_json.dumps(entry) + "\n")
+        except Exception:
+            pass
         sys.exit(1)
 
 

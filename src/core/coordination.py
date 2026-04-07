@@ -42,12 +42,12 @@ def generate_instance_id() -> str:
 def _coordination_paths(state_dir: Path) -> dict:
     """Return {instances_dir, claims_dir} under .harness/coordination/.
 
-    coordination dir is at .harness/coordination/ (sibling of .harness/state/).
-    state_dir is typically  <root>/.harness/state/
-    so we go two levels up to reach .harness/ then into coordination/.
+    state_dir is .harness/runs/<run_id>/ (new) or .harness/state/ (legacy).
+    Coordination is always at .harness/coordination/ (shared across runs).
     """
     state_dir = Path(state_dir)
-    coordination_dir = state_dir.parent / "coordination"
+    harness_dir = state_dir.parent.parent if state_dir.parent.name == "runs" else state_dir.parent
+    coordination_dir = harness_dir / "coordination"
     return {
         "instances_dir": coordination_dir / "instances",
         "claims_dir": coordination_dir / "claims",
@@ -122,6 +122,9 @@ def register_instance(
     pid: int,
     wave: int,
     state_dir: Path,
+    *,
+    worktree_dir: Optional[str] = None,
+    branch: Optional[str] = None,
 ) -> dict:
     """Write instance record to .harness/coordination/instances/{id}.json."""
     paths = _coordination_paths(state_dir)
@@ -137,6 +140,8 @@ def register_instance(
         "startedAt": now,
         "lastSeen": now,
         "status": "active",
+        "worktreeDir": worktree_dir,
+        "branch": branch,
     }
     atomic_write(instances_dir / f"{instance_id}.json", data)
     return data
@@ -263,8 +268,8 @@ def sweep_stale_instances(
         last_seen = instance.get("lastSeen", "")
         instance_id = instance.get("instanceId", "")
 
-        # Check PID liveness
-        dead = pid is not None and not _is_process_alive(pid)
+        # Check PID liveness (pid=0 or None means unknown — rely on age check only)
+        dead = pid is not None and pid > 0 and not _is_process_alive(pid)
 
         # Check age staleness
         stale = False
@@ -286,7 +291,22 @@ def sweep_stale_instances(
         swept.append({
             **instance,
             "reason": "dead process" if dead else "stale",
+            "worktreeDir": instance.get("worktreeDir"),
+            "branch": instance.get("branch"),
         })
+
+    # Sweep orphaned claims — claims with no matching instance file
+    instance_ids = {i.get("instanceId") for i in list_instances(state_dir)}
+    for claim in list_claims(state_dir):
+        cid = claim.get("instanceId", "")
+        if cid and cid not in instance_ids:
+            _remove_file_if_exists(paths["claims_dir"] / f"{cid}.json")
+            swept.append({
+                **claim,
+                "reason": "orphaned claim",
+                "worktreeDir": claim.get("worktreeDir"),
+                "branch": claim.get("branch"),
+            })
 
     return swept
 

@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from .fleet_session import fleet_dir
+
 
 def parse_handoff(output: str) -> dict:
     """Parse ---HANDOFF--- block from generator output.
@@ -127,46 +129,85 @@ def write_brief(brief: str, wave: int, agent_id: str, state_dir: Path) -> Path:
 
     Returns path to written file. Creates directories as needed.
     """
-    briefs_dir = Path(state_dir).parent / "fleet" / "briefs"
+    briefs_dir = fleet_dir(state_dir) / "briefs"
     briefs_dir.mkdir(parents=True, exist_ok=True)
     path = briefs_dir / f"w{wave}-{agent_id}.md"
     path.write_text(brief)
     return path
 
 
-def get_relay_context(state_dir: Path, current_wave: int) -> str:
-    """Concatenate all briefs from waves < current_wave.
+def get_relay_context(state_dir: Path, current_wave: int, include_current_wave: bool = False) -> str:
+    """Concatenate briefs from prior waves and optionally the current wave.
 
-    Returns:
-    === DISCOVERY RELAY ===
-    Discoveries from previous waves that you MUST take into account:
+    When include_current_wave=True, agents that start later in the same wave
+    can see briefs from agents that already finished — enabling intra-wave
+    knowledge sharing (e.g., SDK import patterns, component conventions).
 
-    {brief contents}
+    Prioritizes recent and same-wave briefs. Caps total to ~15KB to avoid
+    bloating TASK_BRIEF.md.
 
-    === END DISCOVERY RELAY ===
-
-    Returns "" if no prior briefs exist.
+    Returns "" if no briefs exist.
     """
-    prior = list_briefs(Path(state_dir), wave=None)
-    # Filter to waves strictly less than current_wave and sort by wave number
-    relevant: list[tuple[int, Path]] = []
-    for p in prior:
-        wave_num = _parse_wave_from_filename(p.name)
-        if wave_num is not None and wave_num < current_wave:
-            relevant.append((wave_num, p))
-    relevant.sort(key=lambda t: t[0])
+    all_briefs = [p for p in list_briefs(Path(state_dir), wave=None) if p.exists()]
 
-    if not relevant:
+    same_wave: list[tuple[float, Path]] = []
+    prior_wave: list[tuple[int, float, Path]] = []
+
+    for p in all_briefs:
+        wn = _parse_wave_from_filename(p.name)
+        if wn is None:
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue  # file vanished between list and stat
+        if wn == current_wave and include_current_wave:
+            same_wave.append((mtime, p))
+        elif wn < current_wave:
+            prior_wave.append((wn, mtime, p))
+
+    # Same-wave: newest first. Prior: highest wave first, then newest first within wave.
+    same_wave.sort(key=lambda t: t[0], reverse=True)
+    prior_wave.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+    if not same_wave and not prior_wave:
         return ""
 
+    MAX_CHARS = 15000  # ~3750 tokens — keeps TASK_BRIEF.md manageable
     parts = []
-    for _, p in relevant:
-        parts.append(p.read_text())
+    total_size = 0
+
+    # Same-wave briefs first — most relevant (parallel siblings)
+    if same_wave:
+        parts.append("### Same-wave discoveries (agents working in parallel with you)")
+        for _, p in same_wave:
+            try:
+                content = p.read_text()
+            except OSError:
+                continue
+            if total_size + len(content) > MAX_CHARS:
+                break
+            parts.append(content)
+            total_size += len(content)
+
+    # Prior-wave briefs — recent ones only
+    if prior_wave and total_size < MAX_CHARS:
+        parts.append("### Prior-wave discoveries")
+        for _, _, p in prior_wave:
+            try:
+                content = p.read_text()
+            except OSError:
+                continue
+            if total_size + len(content) > MAX_CHARS:
+                break
+            parts.append(content)
+            total_size += len(content)
 
     body = "\n\n".join(parts)
     return (
         "=== DISCOVERY RELAY ===\n"
-        "Discoveries from previous waves that you MUST take into account:\n\n"
+        "Discoveries from other agents that you MUST take into account.\n"
+        "Pay special attention to same-wave discoveries — these agents worked on similar tasks.\n\n"
         f"{body}\n\n"
         "=== END DISCOVERY RELAY ==="
     )
@@ -174,7 +215,7 @@ def get_relay_context(state_dir: Path, current_wave: int) -> str:
 
 def list_briefs(state_dir: Path, wave: Optional[int] = None) -> list[Path]:
     """List all brief files, optionally filtered by wave number."""
-    briefs_dir = Path(state_dir).parent / "fleet" / "briefs"
+    briefs_dir = fleet_dir(state_dir) / "briefs"
     if not briefs_dir.exists():
         return []
 

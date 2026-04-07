@@ -30,7 +30,7 @@ hook_dir = Path(__file__).parent
 harness_dir = hook_dir.parent
 sys.path.insert(0, str(harness_dir))
 
-from core.completion import check_completion
+from core.completion import check_completion, _find_active_state_dir
 from core.circuit_breaker import CircuitBreaker
 
 
@@ -45,9 +45,9 @@ def main():
     if input_data.get("stop_hook_active", False):
         sys.exit(0)
 
-    # Find harness state directory
-    state_dir = harness_dir / "state"
-    if not state_dir.exists():
+    # Find active run's state directory (supports both new runs/ and legacy state/)
+    state_dir = _find_active_state_dir(harness_dir)
+    if state_dir is None:
         sys.exit(0)  # No harness state, allow exit
 
     # Check circuit breaker — if OPEN, don't force continuation (stagnation)

@@ -168,6 +168,47 @@ class ControlPlaneClient:
 
         _do()
 
+    def resume_run(self, project_id: str, project_dir: str = "") -> None:
+        """Attach to the most recent non-terminal run instead of creating a new one.
+
+        Looks for a 'running' or 'pending' run for this project. If found,
+        reuses its ID. Falls back to create_run if none found.
+        """
+        if not self.enabled:
+            return
+
+        try:
+            self._ensure_project(project_id, project_dir)
+            runs = self._get(f"/api/v1/runs?project_id={project_id}")
+            if runs:
+                for run in runs:
+                    if run.get("status") in ("running", "pending"):
+                        self.run_id = run["id"]
+                        if self._buffer_path and self._buffer_path.exists():
+                            self._start_drain()
+                        return
+        except Exception:
+            pass
+
+        # No resumable run found — create a new one
+        self.create_run(project_id, project_dir)
+
+    def push_work_plan(self, work_plan_data: dict) -> None:
+        """Push hierarchical work plan (phases/epics/stories/tasks) to control plane."""
+        if not self.enabled or not self.run_id:
+            return
+
+        run_id = self.run_id
+        path = f"/api/v1/runs/{run_id}/work-plan"
+
+        def _do():
+            try:
+                self._post(path, work_plan_data)
+            except Exception:
+                pass
+
+        self._fire(_do)
+
     def post_event(self, event_type: str, **kwargs) -> None:
         """Post a run event asynchronously. Buffers locally if control plane is down."""
         if not self.enabled or not self.run_id:
@@ -175,7 +216,7 @@ class ControlPlaneClient:
 
         run_id = self.run_id
         path = f"/api/v1/runs/{run_id}/events"
-        body = {"event_type": event_type, **kwargs}
+        body = {"type": event_type, **kwargs}
 
         def _do():
             try:

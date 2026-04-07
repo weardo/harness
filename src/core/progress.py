@@ -103,6 +103,11 @@ def detect_git_progress(project_dir: Path) -> list[str]:
             ".harness/state/circuit_breaker.json",
             ".harness/state/exit_signals.json",
         }
+        # Also filter run-scoped state files (new format)
+        noise_files.update(
+            f for f in all_changed
+            if f.startswith(".harness/runs/") and f.endswith(("/state.json", "/circuit_breaker.json", "/exit_signals.json"))
+        )
         meaningful = [f for f in all_changed if f not in noise_files]
         return meaningful
 

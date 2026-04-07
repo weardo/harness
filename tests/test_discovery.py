@@ -337,3 +337,43 @@ class TestListBriefs:
         assert len(wave1) == 2
         wave2 = list_briefs(state_dir, wave=2)
         assert len(wave2) == 1
+
+
+# ---------------------------------------------------------------------------
+# fleet_dir path resolution (regression test for dual-fleet bug)
+# ---------------------------------------------------------------------------
+
+class TestFleetDirResolution:
+    """Verify fleet is per-run — briefs go inside state_dir/fleet/."""
+
+    def test_briefs_land_inside_run_dir(self, tmp_path):
+        """Briefs must land in state_dir/fleet/briefs/, not a shared location."""
+        state_dir = tmp_path / ".harness" / "runs" / "run-001"
+        state_dir.mkdir(parents=True)
+
+        path = write_brief("test brief", wave=1, agent_id="a1", state_dir=state_dir)
+
+        assert path.parent == state_dir / "fleet" / "briefs"
+
+    def test_per_run_isolation(self, tmp_path):
+        """Two runs don't share fleet state."""
+        run1 = tmp_path / "runs" / "run-001"
+        run2 = tmp_path / "runs" / "run-002"
+        run1.mkdir(parents=True)
+        run2.mkdir(parents=True)
+
+        write_brief("run1 brief", wave=1, agent_id="a", state_dir=run1)
+        write_brief("run2 brief", wave=1, agent_id="b", state_dir=run2)
+
+        assert len(list_briefs(run1)) == 1
+        assert len(list_briefs(run2)) == 1
+        assert list_briefs(run1)[0].read_text() == "run1 brief"
+
+    def test_relay_context_scoped_to_run(self, tmp_path):
+        """get_relay_context only sees briefs from its own run."""
+        state_dir = tmp_path / "runs" / "run-003"
+        state_dir.mkdir(parents=True)
+
+        write_brief("Wave 1 discovery", wave=1, agent_id="a", state_dir=state_dir)
+        result = get_relay_context(state_dir, current_wave=2)
+        assert "Wave 1 discovery" in result

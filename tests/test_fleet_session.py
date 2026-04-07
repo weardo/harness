@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.core.fleet_session import (
-    _fleet_dir,
+    fleet_dir,
     _session_path,
     load_session,
     save_session,
@@ -37,21 +37,31 @@ def tmp_dir():
 
 @pytest.fixture
 def state_dir(tmp_dir):
-    """Simulate .harness/state/ directory so fleet/ becomes a sibling."""
-    sd = tmp_dir / ".harness" / "state"
+    """Simulate a run's state directory."""
+    sd = tmp_dir / ".harness" / "runs" / "run-001"
     sd.mkdir(parents=True)
     return sd
 
 
 class TestFleetDir:
-    def test_fleet_dir_is_sibling_of_state(self, state_dir):
-        fd = _fleet_dir(state_dir)
-        assert fd == state_dir.parent / "fleet"
+    def test_fleet_dir_is_inside_state_dir(self, state_dir):
+        fd = fleet_dir(state_dir)
+        assert fd == state_dir / "fleet"
         assert fd.name == "fleet"
+
+    def test_fleet_dir_per_run_isolation(self, tmp_dir):
+        """Each run gets its own fleet dir."""
+        run1 = tmp_dir / "runs" / "run-001"
+        run2 = tmp_dir / "runs" / "run-002"
+        run1.mkdir(parents=True)
+        run2.mkdir(parents=True)
+        assert fleet_dir(run1) != fleet_dir(run2)
+        assert fleet_dir(run1) == run1 / "fleet"
+        assert fleet_dir(run2) == run2 / "fleet"
 
     def test_session_path(self, state_dir):
         sp = _session_path(state_dir)
-        assert sp == state_dir.parent / "fleet" / "session.json"
+        assert sp == state_dir / "fleet" / "session.json"
 
 
 class TestInitSession:
@@ -98,7 +108,7 @@ class TestLoadSaveSession:
     def test_save_creates_fleet_dir(self, state_dir):
         session = {"status": "test", "work_queue": []}
         save_session(session, state_dir)
-        assert _fleet_dir(state_dir).exists()
+        assert fleet_dir(state_dir).exists()
 
 
 class TestAddToQueue:

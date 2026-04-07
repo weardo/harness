@@ -11,6 +11,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .parallel import _rescue_submodule_objects
+
 
 def list_worktrees(repo_dir) -> list[dict]:
     """Return a list of all git worktrees for the given repo.
@@ -100,7 +102,33 @@ def sweep_merged_worktrees(repo_dir, dry_run: bool = False) -> list[str]:
 
         if is_ancestor_of(repo_dir, wt["commit"], target=main_head):
             path_str = str(wt["path"])
+
+            # NEVER remove a worktree that has uncommitted changes — a generator
+            # may be actively writing files but hasn't committed yet.
+            wt_path = Path(path_str)
+            if wt_path.exists():
+                _dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(wt_path),
+                    capture_output=True, text=True, timeout=10,
+                )
+                # Also check submodules for uncommitted changes
+                _sub_dirty = subprocess.run(
+                    ["git", "submodule", "foreach", "--quiet",
+                     "git", "status", "--porcelain"],
+                    cwd=str(wt_path),
+                    capture_output=True, text=True, timeout=15,
+                )
+                if _dirty.stdout.strip() or _sub_dirty.stdout.strip():
+                    continue  # Skip — worktree has uncommitted work in progress
+
             if not dry_run:
+                # Rescue submodule objects before destroying the worktree
+                if wt["branch"]:
+                    try:
+                        _rescue_submodule_objects(repo_dir, wt["branch"])
+                    except Exception:
+                        pass  # Best-effort
                 subprocess.run(
                     ["git", "worktree", "remove", "--force", path_str],
                     cwd=str(repo_dir),

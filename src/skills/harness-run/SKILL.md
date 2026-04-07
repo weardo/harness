@@ -31,7 +31,7 @@ argument-hint: "<prompt> [--spec path] [--plan path] [--max-cost N] [--delegatio
    ```
    This is a long-running command. Let it run — it will output progress as it goes.
 
-4. **After completion:** Read `.harness/state/state.json` and report final summary:
+4. **After completion:** Read `.harness/runs.json` to find the run, then read `<run-dir>/state.json` and report final summary:
    - Features: done/total/blocked
    - Cost: total USD
    - Duration

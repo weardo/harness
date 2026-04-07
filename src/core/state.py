@@ -9,7 +9,10 @@ Pattern from autonomous-coding-harness (GantisStorm).
 import asyncio
 import json
 import os
+import re
+import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,6 +49,131 @@ def atomic_read(path: Path) -> Optional[dict]:
         return None
     with open(path) as f:
         return json.load(f)
+
+
+class RunRegistry:
+    """Manages run lifecycle and index. No singleton — every run is isolated."""
+
+    def __init__(self, harness_dir: Path):
+        self.harness_dir = Path(harness_dir)
+        self.harness_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir = self.harness_dir / "runs"
+        self.runs_dir.mkdir(exist_ok=True)
+        self.index_path = self.harness_dir / "runs.json"
+
+    def _load_index(self) -> list:
+        data = atomic_read(self.index_path)
+        if data is None:
+            return []
+        return data.get("runs", [])
+
+    def _save_index(self, runs: list) -> None:
+        atomic_write(self.index_path, {"runs": runs})
+
+    def _make_slug(self, prompt: str) -> str:
+        """Sanitize prompt into a short slug for the run ID."""
+        if not prompt:
+            return ""
+        slug = prompt.lower().strip()
+        slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+        slug = re.sub(r"[\s-]+", "-", slug).strip("-")
+        return slug[:40]
+
+    def create_run(self, prompt: str = "") -> str:
+        """Create a new run directory and index entry. Returns run_id."""
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%dT%H%M%S")
+        slug = self._make_slug(prompt)
+        run_id = f"run-{ts}-{slug}" if slug else f"run-{ts}"
+
+        run_dir = self.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        runs = self._load_index()
+        runs.append({
+            "run_id": run_id,
+            "prompt": prompt,
+            "status": "in_progress",
+            "started_at": now.isoformat(),
+            "completed_at": None,
+            "total_cost_usd": 0.0,
+            "features_total": 0,
+            "features_passing": 0,
+        })
+        self._save_index(runs)
+        return run_id
+
+    def run_dir(self, run_id: str) -> Path:
+        """Get directory path for a run. Raises ValueError if not found."""
+        d = self.runs_dir / run_id
+        if not d.exists():
+            raise ValueError(f"Run '{run_id}' not found in {self.runs_dir}")
+        return d
+
+    def list_runs(self) -> list:
+        """List all runs from the index."""
+        return self._load_index()
+
+    def update_run(self, run_id: str, **updates) -> None:
+        """Update fields on a run in the index."""
+        runs = self._load_index()
+        for run in runs:
+            if run["run_id"] == run_id:
+                run.update(updates)
+                break
+        self._save_index(runs)
+
+    def find_resumable(self) -> Optional[str]:
+        """Find the latest run with status 'in_progress'. Returns run_id or None."""
+        runs = self._load_index()
+        for run in reversed(runs):
+            if run.get("status") == "in_progress":
+                return run["run_id"]
+        return None
+
+    def migrate_legacy(self) -> Optional[str]:
+        """Migrate old .harness/state/ layout to .harness/runs/. Returns run_id or None."""
+        legacy_dir = self.harness_dir / "state"
+        if not legacy_dir.is_dir():
+            return None
+
+        # Only migrate if state.json exists — empty state/ dirs are not real runs
+        legacy_state = atomic_read(legacy_dir / "state.json")
+        if legacy_state is None:
+            # Empty dir (e.g., from old install.sh) — just remove it
+            try:
+                legacy_dir.rmdir()
+            except OSError:
+                pass  # Dir not empty with non-state files — leave it
+            return None
+        status = "complete" if legacy_state and legacy_state.get("planner_complete") else "in_progress"
+        started_at = (legacy_state or {}).get("started_at", datetime.now(timezone.utc).isoformat())
+
+        run_id = "run-legacy-migrated"
+        run_dir = self.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Move all files from state/ to the new run dir
+        for item in legacy_dir.iterdir():
+            shutil.move(str(item), str(run_dir / item.name))
+
+        # Remove the now-empty legacy dir
+        legacy_dir.rmdir()
+
+        # Add index entry
+        runs = self._load_index()
+        runs.append({
+            "run_id": run_id,
+            "prompt": "",
+            "status": status,
+            "started_at": started_at,
+            "completed_at": None,
+            "total_cost_usd": (legacy_state or {}).get("total_cost_usd", 0.0),
+            "features_total": 0,
+            "features_passing": 0,
+        })
+        self._save_index(runs)
+        return run_id
 
 
 class StateManager:
@@ -224,6 +352,203 @@ class StateManager:
         """Remove feedback file after generator addresses it."""
         if self.feedback_path.exists():
             self.feedback_path.unlink()
+
+    # -------------------------------------------------------------------------
+    # Planner State Machine
+    # -------------------------------------------------------------------------
+
+    def _default_planner_state(self) -> dict:
+        return {
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "total_cost_usd": 0.0,
+            "fix_loops_completed": 0,
+            "max_fix_loops": 2,
+            "roles": [],
+        }
+
+    def get_planner_state(self) -> dict:
+        """Get structured planner state, creating defaults if missing."""
+        state = self.load_state()
+        return state.get("planner", self._default_planner_state())
+
+    def _save_planner_state(self, planner: dict) -> None:
+        """Save planner state into the main state dict."""
+        state = self.load_state()
+        state["planner"] = planner
+        self.save_state(state)
+
+    def start_planner(self) -> None:
+        """Mark planner as in_progress with a start timestamp."""
+        ps = self.get_planner_state()
+        ps["status"] = "in_progress"
+        ps["started_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_planner_state(ps)
+
+    def complete_planner(self) -> None:
+        """Mark planner as complete."""
+        ps = self.get_planner_state()
+        ps["status"] = "complete"
+        ps["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_planner_state(ps)
+        # Keep backward compat field in sync
+        self.update_state(planner_complete=True)
+
+    def start_role(self, name: str, model: str = "", triggered_by: str = "") -> None:
+        """Append a new role entry with status=running."""
+        ps = self.get_planner_state()
+        # Calculate attempt number for this role name
+        attempt = sum(1 for r in ps["roles"] if r["name"] == name) + 1
+        entry = {
+            "name": name,
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "duration_s": 0,
+            "cost_usd": 0.0,
+            "model": model,
+            "artifact": None,
+            "artifact_size_bytes": 0,
+            "attempt": attempt,
+            "validation": None,
+        }
+        if triggered_by:
+            entry["triggered_by"] = triggered_by
+        ps["roles"].append(entry)
+        self._save_planner_state(ps)
+
+    def _find_latest_role(self, name: str, planner: dict) -> Optional[dict]:
+        """Find the most recent role entry by name."""
+        for role in reversed(planner["roles"]):
+            if role["name"] == name:
+                return role
+        return None
+
+    def complete_role(self, name: str, cost_usd: float = 0.0,
+                      artifact: str = "", artifact_size_bytes: int = 0,
+                      validation: Optional[dict] = None) -> None:
+        """Mark the latest entry for this role as complete."""
+        ps = self.get_planner_state()
+        role = self._find_latest_role(name, ps)
+        if role:
+            now = datetime.now(timezone.utc).isoformat()
+            role["status"] = "complete"
+            role["completed_at"] = now
+            role["cost_usd"] = cost_usd
+            if artifact:
+                role["artifact"] = artifact
+            if artifact_size_bytes:
+                role["artifact_size_bytes"] = artifact_size_bytes
+            if validation is not None:
+                role["validation"] = validation
+            # Calculate duration
+            if role.get("started_at"):
+                started = datetime.fromisoformat(role["started_at"])
+                ended = datetime.fromisoformat(now)
+                role["duration_s"] = int((ended - started).total_seconds())
+        ps["total_cost_usd"] += cost_usd
+        self._save_planner_state(ps)
+
+    def reject_role(self, name: str, cost_usd: float = 0.0,
+                    artifact: str = "", validation: Optional[dict] = None) -> None:
+        """Mark the latest entry for this role as rejected."""
+        ps = self.get_planner_state()
+        role = self._find_latest_role(name, ps)
+        if role:
+            now = datetime.now(timezone.utc).isoformat()
+            role["status"] = "rejected"
+            role["completed_at"] = now
+            role["cost_usd"] = cost_usd
+            if artifact:
+                role["artifact"] = artifact
+            if validation is not None:
+                role["validation"] = validation
+            if role.get("started_at"):
+                started = datetime.fromisoformat(role["started_at"])
+                ended = datetime.fromisoformat(now)
+                role["duration_s"] = int((ended - started).total_seconds())
+        ps["total_cost_usd"] += cost_usd
+        self._save_planner_state(ps)
+
+    def fail_role(self, name: str, reason: str = "") -> None:
+        """Mark the latest entry for this role as failed."""
+        ps = self.get_planner_state()
+        role = self._find_latest_role(name, ps)
+        if role:
+            role["status"] = "failed"
+            role["completed_at"] = datetime.now(timezone.utc).isoformat()
+            role["error"] = reason
+        self._save_planner_state(ps)
+
+    def increment_fix_loops(self) -> int:
+        """Increment fix loop counter. Returns new count."""
+        ps = self.get_planner_state()
+        ps["fix_loops_completed"] = ps.get("fix_loops_completed", 0) + 1
+        self._save_planner_state(ps)
+        return ps["fix_loops_completed"]
+
+    def get_resume_point(self) -> dict:
+        """Determine where to resume planner execution.
+
+        Returns:
+            {"action": "skip_planner"} — planner already complete
+            {"action": "rerun", "role_name": str} — role crashed mid-run, re-run it
+            {"action": "fix_loop", "role_name": str} — validator rejected, run refiner-fix
+            {"action": "proceed_with_warning"} — max fix loops hit, proceed anyway
+            {"action": "next_role"} — all existing roles complete, continue to next
+        """
+        ps = self.get_planner_state()
+
+        if ps["status"] == "complete":
+            return {"action": "skip_planner"}
+
+        roles = ps["roles"]
+        if not roles:
+            return {"action": "next_role"}
+
+        last_role = roles[-1]
+
+        if last_role["status"] == "running":
+            return {"action": "rerun", "role_name": last_role["name"]}
+
+        if last_role["status"] == "rejected":
+            if ps.get("fix_loops_completed", 0) >= ps.get("max_fix_loops", 2):
+                return {"action": "proceed_with_warning"}
+            return {"action": "fix_loop", "role_name": last_role["name"]}
+
+        # All roles ended in complete or failed — move to next
+        return {"action": "next_role"}
+
+    def migrate_legacy_planner_state(self) -> None:
+        """Migrate old planner_roles dict to structured planner state."""
+        state = self.load_state()
+        old_roles = state.get("planner_roles", {})
+        if not old_roles or "planner" in state:
+            return  # Already migrated or nothing to migrate
+
+        ps = self._default_planner_state()
+        if state.get("planner_complete"):
+            ps["status"] = "complete"
+
+        for name, done in old_roles.items():
+            if done:
+                ps["roles"].append({
+                    "name": name,
+                    "status": "complete",
+                    "started_at": None,
+                    "completed_at": None,
+                    "duration_s": 0,
+                    "cost_usd": 0.0,
+                    "model": "",
+                    "artifact": None,
+                    "artifact_size_bytes": 0,
+                    "attempt": 1,
+                    "validation": None,
+                })
+
+        state["planner"] = ps
+        self.save_state(state)
 
     def _default_state(self) -> dict:
         return {

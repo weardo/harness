@@ -191,3 +191,57 @@ class TestEventTrackerFireAndForget:
 
     def test_retro_generated_fire_and_forget(self):
         self.tracker.retro_generated()
+
+    def test_planner_role_reject_fire_and_forget(self):
+        self.tracker.planner_role_reject("validator", issues_count=4, cost_usd=0.67)
+
+
+class TestEventTrackerEnhancedTelemetry:
+    """Tests for enhanced planner role events with cost, duration, attempt."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, mock_cp, tracker):
+        self.mock_cp = mock_cp
+        self.tracker = tracker
+
+    def test_planner_role_pass_includes_cost(self):
+        self.tracker.planner_role_pass("architect", "draft_work_plan.json", 960000, cost_usd=1.23)
+        desc = self.mock_cp.post_event.call_args.kwargs.get(
+            "feature_desc", str(self.mock_cp.post_event.call_args)
+        )
+        assert "$1.23" in desc
+
+    def test_planner_role_pass_includes_attempt(self):
+        self.tracker.planner_role_pass("validator", "validation.json", 500000, attempt=2)
+        desc = self.mock_cp.post_event.call_args.kwargs.get(
+            "feature_desc", str(self.mock_cp.post_event.call_args)
+        )
+        assert "attempt 2" in desc
+
+    def test_planner_role_pass_no_attempt_when_1(self):
+        self.tracker.planner_role_pass("architect", "draft.json", 100000, attempt=1)
+        desc = self.mock_cp.post_event.call_args.kwargs.get(
+            "feature_desc", str(self.mock_cp.post_event.call_args)
+        )
+        assert "attempt" not in desc
+
+    def test_planner_role_fail_includes_cost(self):
+        self.tracker.planner_role_fail("refiner", "timeout", cost_usd=0.45)
+        desc = self.mock_cp.post_event.call_args.kwargs.get(
+            "feature_desc", str(self.mock_cp.post_event.call_args)
+        )
+        assert "$0.45" in desc
+
+    def test_planner_role_reject_includes_issues(self):
+        self.tracker.planner_role_reject("validator", issues_count=4, cost_usd=0.67, attempt=1)
+        desc = self.mock_cp.post_event.call_args.kwargs.get(
+            "feature_desc", str(self.mock_cp.post_event.call_args)
+        )
+        assert "REJECTED" in desc
+        assert "4 issues" in desc
+        assert "$0.67" in desc
+
+    def test_planner_role_pass_backward_compat(self):
+        """Old callers passing only 3 args still work."""
+        self.tracker.planner_role_pass("architect", "draft.json", 1000)
+        self.mock_cp.post_event.assert_called_once()

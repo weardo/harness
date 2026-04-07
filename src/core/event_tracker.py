@@ -30,6 +30,13 @@ class EventTracker:
     # Setup phase
     # -------------------------------------------------------------------------
 
+    def push_work_plan(self, work_plan_data: dict) -> None:
+        """Push hierarchical work plan to control plane for dashboard display."""
+        try:
+            self.cp.push_work_plan(work_plan_data)
+        except Exception:
+            pass
+
     def run_started(self, features_planned: int = 0) -> None:
         """Emit run_start event with planned feature count."""
         try:
@@ -89,24 +96,48 @@ class EventTracker:
         except Exception:
             pass
 
-    def planner_role_pass(self, role_name: str, artifact: str, duration_ms: int) -> None:
-        """Emit planner role pass event with artifact name and duration."""
+    def planner_role_pass(
+        self, role_name: str, artifact: str, duration_ms: int,
+        cost_usd: float = 0.0, attempt: int = 1,
+    ) -> None:
+        """Emit planner role pass event with artifact, duration, cost, and attempt."""
         try:
+            parts = [f"artifact: {artifact}", f"{duration_ms}ms"]
+            if cost_usd > 0:
+                parts.append(f"${cost_usd:.2f}")
+            if attempt > 1:
+                parts.append(f"attempt {attempt}")
             self.cp.post_event(
                 event_type="feature_pass",
                 feature_id=f"planner-{role_name}",
-                feature_desc=f"Planning: {role_name.capitalize()} — artifact: {artifact} ({duration_ms}ms)",
+                feature_desc=f"Planning: {role_name.capitalize()} — {', '.join(parts)}",
             )
         except Exception:
             pass
 
-    def planner_role_fail(self, role_name: str, reason: str) -> None:
-        """Emit planner role fail event with reason."""
+    def planner_role_fail(self, role_name: str, reason: str, cost_usd: float = 0.0, attempt: int = 1) -> None:
+        """Emit planner role fail event with reason, cost, and attempt."""
         try:
+            parts = [reason]
+            if cost_usd > 0:
+                parts.append(f"${cost_usd:.2f}")
+            if attempt > 1:
+                parts.append(f"attempt {attempt}")
             self.cp.post_event(
                 event_type="feature_fail",
                 feature_id=f"planner-{role_name}",
-                feature_desc=f"Planning: {role_name.capitalize()} failed — {reason}",
+                feature_desc=f"Planning: {role_name.capitalize()} failed — {', '.join(parts)}",
+            )
+        except Exception:
+            pass
+
+    def planner_role_reject(self, role_name: str, issues_count: int = 0, cost_usd: float = 0.0, attempt: int = 1) -> None:
+        """Emit planner role rejection event (validator rejected)."""
+        try:
+            self.cp.post_event(
+                event_type="feature_fail",
+                feature_id=f"planner-{role_name}-rejected",
+                feature_desc=f"Planning: {role_name.capitalize()} REJECTED — {issues_count} issues, ${cost_usd:.2f}, attempt {attempt}",
             )
         except Exception:
             pass
@@ -211,9 +242,10 @@ class EventTracker:
         """Emit wave start event."""
         try:
             self.cp.post_event(
-                event_type="feature_start",
-                feature_id=f"wave-{wave}-start",
-                feature_desc=f"Wave {wave}: {agent_count} agents — {', '.join(feature_ids[:5])}",
+                event_type="wave_start",
+                wave_num=wave,
+                agent_count=agent_count,
+                feature_ids=feature_ids,
             )
         except Exception:
             pass
@@ -222,9 +254,11 @@ class EventTracker:
         """Emit wave completion event."""
         try:
             self.cp.post_event(
-                event_type="feature_pass",
-                feature_id=f"wave-{wave}-complete",
-                feature_desc=f"Wave {wave}: {completed} done, {failed} failed, {conflicts} conflicts",
+                event_type="wave_complete",
+                wave_num=wave,
+                completed=completed,
+                failed=failed,
+                conflicts=conflicts,
             )
         except Exception:
             pass
@@ -233,9 +267,11 @@ class EventTracker:
         """Emit agent timeout event."""
         try:
             self.cp.post_event(
-                event_type="feature_fail",
-                feature_id=f"timeout-{feature_id}",
-                feature_desc=f"Agent {agent_id} timed out on {feature_id} after {elapsed_s:.0f}s",
+                event_type="agent_timeout",
+                wave_num=0,
+                agent_id=agent_id,
+                feature_id=feature_id,
+                error=f"Agent {agent_id} timed out on {feature_id} after {elapsed_s:.0f}s",
             )
         except Exception:
             pass
@@ -244,21 +280,21 @@ class EventTracker:
         """Emit merge conflict event."""
         try:
             self.cp.post_event(
-                event_type="feature_fail",
-                feature_id=f"conflict-{feature_id}",
-                feature_desc=f"Merge conflict: {feature_id} by {agent_id} — requeued",
+                event_type="merge_conflict",
+                wave_num=0,
+                agent_id=agent_id,
+                feature_id=feature_id,
                 error=error[:200],
             )
         except Exception:
             pass
 
     def wave_all_failed(self, wave: int, reasons: list) -> None:
-        """Emit wave total failure escalation event."""
+        """Emit wave all-failed escalation event."""
         try:
             self.cp.post_event(
-                event_type="feature_fail",
-                feature_id=f"wave-{wave}-all-failed",
-                feature_desc=f"Wave {wave}: ALL agents failed — falling back to sequential",
+                event_type="wave_all_failed",
+                wave_num=wave,
                 error="; ".join(reasons[:3]),
             )
         except Exception:
@@ -279,13 +315,21 @@ class EventTracker:
         except Exception:
             pass
 
-    def run_complete(self, features_done: int, cost_usd: float) -> None:
-        """Emit run complete event."""
+    def run_complete(self, features_done: int, cost_usd: float,
+                     input_tokens: int = 0, output_tokens: int = 0,
+                     total_turns: int = 0, api_time_ms: int = 0) -> None:
+        """Emit run complete event with cost and token telemetry."""
         try:
+            total_tokens = input_tokens + output_tokens
             self.cp.post_event(
                 event_type="run_complete",
                 feature_id="completion-run",
-                feature_desc=f"Completion: Run complete — {features_done} features, ${cost_usd:.2f}",
+                feature_desc=f"Completion: Run complete — {features_done} features, ${cost_usd:.2f}, {total_tokens:,} tokens",
+                cost_usd=cost_usd,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_turns=total_turns,
+                api_time_ms=api_time_ms,
             )
         except Exception:
             pass

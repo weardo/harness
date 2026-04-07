@@ -190,21 +190,25 @@ class TestParallelWaveBasic:
         })
 
         # Mock worktree ops (no real git)
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.merge_worktree") as mock_merge, \
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-{_wt_counter[0]}")
+
+        async def _mock_session(prompt, *args, **kwargs):
+            if "assigned feature" in prompt.lower() or "TASK_BRIEF" in prompt:
+                return {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01}
+            return {"output": MOCK_EVALUATOR_PASS, "cost": 0.005}
+
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.merge_worktree", return_value={"success": True, "conflict": False, "error": ""}), \
              patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
-
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            mock_merge.return_value = {"success": True, "conflict": False, "error": ""}
-
-            # First 2 calls = generators, next 2 = evaluators
-            mock_session.side_effect = [
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-            ]
+             patch("src.core.orchestrator.branch_has_commits", return_value=True), \
+             patch("src.core.orchestrator.claim_scope"), \
+             patch("src.core.orchestrator.write_task_brief"), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=_mock_session):
 
             result = run_async(run_parallel_wave(
                 layer=layer,
@@ -237,17 +241,24 @@ class TestParallelWaveBasic:
              "status": "pending", "passes": False, "blocked": False},
         ]
 
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.merge_worktree") as mock_merge, \
-             patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-scope-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-scope-{_wt_counter[0]}")
 
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            mock_merge.return_value = {"success": True, "conflict": False, "error": ""}
-            mock_session.side_effect = [
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-            ]
+        async def _mock_session(prompt, *args, **kwargs):
+            if "assigned feature" in prompt.lower() or "TASK_BRIEF" in prompt:
+                return {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01}
+            return {"output": MOCK_EVALUATOR_PASS, "cost": 0.005}
+
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.merge_worktree", return_value={"success": True, "conflict": False, "error": ""}), \
+             patch("src.core.orchestrator.cleanup_worktree"), \
+             patch("src.core.orchestrator.branch_has_commits", return_value=True), \
+             patch("src.core.orchestrator.write_task_brief"), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=_mock_session):
 
             result = run_async(run_parallel_wave(
                 layer=tasks,
@@ -273,22 +284,31 @@ class TestParallelWaveBasic:
         env = harness_env
         layer = env["work_plan"].flatten_for_grouping()
 
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.merge_worktree") as mock_merge, \
-             patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-{_wt_counter[0]}")
 
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            # First merge succeeds, second conflicts
-            mock_merge.side_effect = [
-                {"success": True, "conflict": False, "error": ""},
-                {"success": False, "conflict": True, "error": "CONFLICT in src/shared.py"},
-            ]
-            mock_session.side_effect = [
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-            ]
+        async def _mock_session(prompt, *args, **kwargs):
+            if "assigned feature" in prompt.lower() or "TASK_BRIEF" in prompt:
+                return {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01}
+            return {"output": MOCK_EVALUATOR_PASS, "cost": 0.005}
+
+        # First merge succeeds, second conflicts
+        merge_results = iter([
+            {"success": True, "conflict": False, "error": ""},
+            {"success": False, "conflict": True, "error": "CONFLICT in src/shared.py"},
+        ])
+
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.merge_worktree", side_effect=lambda *a, **kw: next(merge_results)), \
+             patch("src.core.orchestrator.cleanup_worktree"), \
+             patch("src.core.orchestrator.branch_has_commits", return_value=True), \
+             patch("src.core.orchestrator.claim_scope"), \
+             patch("src.core.orchestrator.write_task_brief"), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=_mock_session):
 
             result = run_async(run_parallel_wave(
                 layer=layer,
@@ -317,12 +337,19 @@ class TestParallelWaveFailure:
         env = harness_env
         layer = env["work_plan"].flatten_for_grouping()
 
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-fail-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-fail-{_wt_counter[0]}")
 
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            mock_session.side_effect = Exception("API error")
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.cleanup_worktree"), \
+             patch("src.core.orchestrator.branch_has_commits", return_value=False), \
+             patch("src.core.orchestrator.claim_scope"), \
+             patch("src.core.orchestrator.write_task_brief"), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=Exception("API error")):
 
             result = run_async(run_parallel_wave(
                 layer=layer,
@@ -377,7 +404,7 @@ class TestDiscoveryRelay:
     """Test that discovery briefs are written and injected."""
 
     def test_briefs_written_after_wave(self, harness_env):
-        """After a wave, brief files should exist in .harness/fleet/briefs/."""
+        """After a wave, brief files should exist in state_dir/fleet/briefs/."""
         env = harness_env
         layer = env["work_plan"].flatten_for_grouping()
 
@@ -410,7 +437,7 @@ class TestDiscoveryRelay:
                 session=env["session"],
             ))
 
-        briefs_dir = env["state_dir"].parent / "fleet" / "briefs"
+        briefs_dir = env["state_dir"] / "fleet" / "briefs"
         assert briefs_dir.exists()
         brief_files = list(briefs_dir.glob("w1-*.md"))
         assert len(brief_files) == 2

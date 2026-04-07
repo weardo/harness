@@ -1,10 +1,11 @@
 """Tests for orchestrator.py — 3-agent loop logic."""
 
+import asyncio
 import json
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
@@ -18,8 +19,11 @@ from src.core.orchestrator import (
     _perform_sweep,
     _perform_suspicion_check,
     _perform_browser_check,
+    _setup_run,
+    run_agent_session_cli,
 )
 from src.core.control_plane import ControlPlaneClient
+from src.core.state import RunRegistry, StateManager
 
 
 @pytest.fixture
@@ -310,7 +314,7 @@ class TestFeatureDescInEvents:
 
         assert len(bodies) == 1
         body = bodies[0]
-        assert body["event_type"] == "feature_pass"
+        assert body["type"] == "feature_pass"
         assert body["feature_id"] == "007"
         assert body["feature_desc"] == "Add worktree sweep"
 
@@ -329,7 +333,7 @@ class TestFeatureDescInEvents:
 
         assert len(bodies) == 1
         body = bodies[0]
-        assert body["event_type"] == "feature_fail"
+        assert body["type"] == "feature_fail"
         assert body["feature_id"] == "007"
         assert body["feature_desc"] == "Add worktree sweep"
 
@@ -762,3 +766,224 @@ class TestPipelineIntegration:
                 pass
 
         assert len(bpp_calls) >= 1
+
+
+class TestSetupRun:
+    """Tests for _setup_run() — run isolation and registry integration."""
+
+    def test_new_run_creates_isolated_dir(self, tmp_dir):
+        """New run creates .harness/runs/<run_id>/ and returns state_mgr scoped to it."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+        run_id, state_mgr, registry = _setup_run(
+            project_dir, resume=False, run_id=None, prompt="build auth"
+        )
+        assert run_id.startswith("run-")
+        assert "build-auth" in run_id
+        assert state_mgr.state_dir == registry.run_dir(run_id)
+        assert state_mgr.state_dir.is_dir()
+
+    def test_resume_finds_latest_incomplete(self, tmp_dir):
+        """Resume without run_id finds the latest in_progress run."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+        harness_dir = project_dir / ".harness"
+        harness_dir.mkdir()
+
+        # Create a completed run and an in-progress run
+        reg = RunRegistry(harness_dir)
+        id1 = reg.create_run(prompt="old")
+        reg.update_run(id1, status="complete")
+        id2 = reg.create_run(prompt="active")
+        # Write some state so it looks like a real run
+        sm = StateManager(reg.run_dir(id2))
+        sm.update_state(phase="generator")
+
+        run_id, state_mgr, registry = _setup_run(
+            project_dir, resume=True, run_id=None, prompt=""
+        )
+        assert run_id == id2
+        assert state_mgr.state_dir == registry.run_dir(id2)
+
+    def test_resume_with_explicit_run_id(self, tmp_dir):
+        """Resume with explicit run_id targets that specific run."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+        harness_dir = project_dir / ".harness"
+        harness_dir.mkdir()
+
+        reg = RunRegistry(harness_dir)
+        id1 = reg.create_run(prompt="target")
+
+        run_id, state_mgr, registry = _setup_run(
+            project_dir, resume=True, run_id=id1, prompt=""
+        )
+        assert run_id == id1
+
+    def test_resume_no_incomplete_creates_new(self, tmp_dir):
+        """Resume when all runs are complete creates a new run."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+        harness_dir = project_dir / ".harness"
+        harness_dir.mkdir()
+
+        reg = RunRegistry(harness_dir)
+        id1 = reg.create_run(prompt="done")
+        reg.update_run(id1, status="complete")
+
+        run_id, state_mgr, registry = _setup_run(
+            project_dir, resume=True, run_id=None, prompt="new work"
+        )
+        assert run_id != id1
+        assert len(registry.list_runs()) == 2
+
+    def test_legacy_state_dir_migrates(self, tmp_dir):
+        """Old .harness/state/ layout is migrated on first _setup_run."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+        harness_dir = project_dir / ".harness"
+        harness_dir.mkdir()
+        legacy_dir = harness_dir / "state"
+        legacy_dir.mkdir()
+        # Write legacy state
+        from src.core.state import atomic_write
+        atomic_write(legacy_dir / "state.json", {
+            "phase": "generator",
+            "planner_complete": True,
+        })
+        (legacy_dir / "work_plan.json").write_text('{"phases": []}')
+
+        run_id, state_mgr, registry = _setup_run(
+            project_dir, resume=False, run_id=None, prompt="after migration"
+        )
+        runs = registry.list_runs()
+        # Should have legacy migrated + new run
+        assert len(runs) == 2
+        assert runs[0]["run_id"] == "run-legacy-migrated"
+        # Legacy dir should be gone
+        assert not legacy_dir.exists()
+
+    def test_two_runs_are_fully_isolated(self, tmp_dir):
+        """Two runs have independent state — writing to one doesn't affect the other."""
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+
+        id1, sm1, reg = _setup_run(project_dir, resume=False, prompt="run 1")
+        id2, sm2, _ = _setup_run(project_dir, resume=False, prompt="run 2")
+
+        sm1.update_state(phase="generator", iteration=5)
+        sm2.update_state(phase="evaluator", iteration=10)
+
+        assert sm1.load_state()["phase"] == "generator"
+        assert sm2.load_state()["phase"] == "evaluator"
+        assert sm1.state_dir != sm2.state_dir
+
+
+class TestRunAgentSessionCli:
+    """Tests for async CLI session runner."""
+
+    def test_cli_session_is_async_and_nonblocking(self, tmp_dir):
+        """Two CLI sessions run concurrently, not sequentially."""
+        timestamps = []
+
+        async def run_two():
+            async def timed_session(label):
+                # Use 'echo' as a fast CLI stand-in
+                result = await run_agent_session_cli(
+                    prompt="hello",
+                    project_dir=tmp_dir,
+                    options={"model": "echo"},  # model doesn't matter, we mock
+                )
+                timestamps.append((label, time.time()))
+                return result
+
+            # Patch to use 'echo' instead of 'claude'
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                async def fake_proc(*args, **kwargs):
+                    proc = AsyncMock()
+                    proc.communicate = AsyncMock(return_value=(b"output", b""))
+                    proc.returncode = 0
+                    proc.kill = MagicMock()
+                    proc.wait = AsyncMock()
+                    # Small delay to simulate work
+                    await asyncio.sleep(0.05)
+                    return proc
+
+                mock_exec.side_effect = fake_proc
+
+                t0 = time.time()
+                await asyncio.gather(
+                    timed_session("a"),
+                    timed_session("b"),
+                )
+                elapsed = time.time() - t0
+
+            # Both should complete in ~0.05s (concurrent), not ~0.1s (sequential)
+            assert elapsed < 0.15  # generous margin
+            assert len(timestamps) == 2
+
+        asyncio.run(run_two())
+
+    def test_cli_session_returns_output(self, tmp_dir):
+        """CLI session captures stdout."""
+        async def run():
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                proc = AsyncMock()
+                proc.communicate = AsyncMock(return_value=(b"hello world", b""))
+                proc.returncode = 0
+                mock_exec.return_value = proc
+
+                result = await run_agent_session_cli("test", tmp_dir)
+                assert result["status"] == "continue"
+                assert "hello world" in result["output"]
+
+        asyncio.run(run())
+
+    def test_cli_session_timeout_kills_process(self, tmp_dir):
+        """CLI session kills process on timeout."""
+        async def run():
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                proc = AsyncMock()
+                # communicate never returns — simulates hang
+                proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+                proc.kill = MagicMock()
+                proc.wait = AsyncMock()
+                proc.returncode = -9
+                mock_exec.return_value = proc
+
+                # Patch wait_for timeout to something short
+                result = await run_agent_session_cli("test", tmp_dir)
+                assert result["status"] == "error"
+                assert "timed out" in result["output"]
+                proc.kill.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_cli_session_nonzero_exit_returns_error(self, tmp_dir):
+        """Non-zero exit code is an error regardless of output."""
+        async def run():
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                proc = AsyncMock()
+                proc.communicate = AsyncMock(return_value=(b"some output", b"rate limit exceeded"))
+                proc.returncode = 1
+                mock_exec.return_value = proc
+
+                result = await run_agent_session_cli("test", tmp_dir)
+                assert result["status"] == "error"
+                assert "exit code 1" in result["error_reason"]
+
+        asyncio.run(run())
+
+    def test_cli_session_zero_exit_returns_continue(self, tmp_dir):
+        """Zero exit code with output returns continue."""
+        async def run():
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                proc = AsyncMock()
+                proc.communicate = AsyncMock(return_value=(b"real output here", b""))
+                proc.returncode = 0
+                mock_exec.return_value = proc
+
+                result = await run_agent_session_cli("test", tmp_dir)
+                assert result["status"] == "continue"
+
+        asyncio.run(run())

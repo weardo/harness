@@ -2,35 +2,47 @@
 name: harness-status
 description: >-
   Show current harness run progress — features done/total, cost, wave status,
-  circuit breaker state. Use to check on an active or completed run.
+  active agents, worktree health. Use to check on an active or completed run.
 user-invocable: true
+argument-hint: "[run-id]"
 ---
 
 # /harness-status — Run Progress
 
-## Protocol
+Run the status script (single command, gathers everything):
 
-1. **Check for state file:**
-   Read `.harness/state/state.json`. If missing → "No active harness run."
+```bash
+python3 .claude/skills/harness-status/status.py --pretty --project "$(pwd)" $ARGUMENTS
+```
 
-2. **Display run status:**
-   From state.json extract and display:
-   - **Phase:** current phase (init/planner/generator/evaluator)
-   - **Iteration:** current iteration number
-   - **Cost:** total_cost_usd + cost_breakdown (planner/generator/evaluator)
-   - **Started:** started_at timestamp
+For terminal watch mode (outside Claude): `python3 .claude/skills/harness-status/status.py -w`
 
-3. **Feature progress:**
-   Read `.harness/state/feature_list.json` or `.harness/state/work_plan.json`.
-   Count: total, passing/done, blocked, remaining.
-   Display as: `Features: 12/20 done, 2 blocked, 6 remaining`
+If `$ARGUMENTS` contains a run ID, pass it as `--run <run-id>`.
 
-4. **Wave progress (if parallel):**
-   Read `.harness/fleet/session.json`. If exists, display:
-   - Current wave number
-   - Waves completed
-   - Requeued features
-   - Discoveries count
+## Output Rules
 
-5. **Circuit breaker:**
-   Read `.harness/state/circuit_breaker.json`. Display state (CLOSED/HALF_OPEN/OPEN) and total opens.
+**ALWAYS display the FULL script output verbatim in a code block first.** Never summarize,
+truncate, paraphrase, or omit any section. The script output is pre-formatted — show every
+line exactly as printed.
+
+After showing the full output, you MAY:
+- Add observations, insights, or warnings based on what you see (e.g., a stuck worker, high failure rate, cost concerns)
+- Investigate further if the user asks (e.g., read logs, check specific task state, dig into failures)
+- Suggest actions (e.g., restart a stuck task, increase pool size, drain the run)
+
+But the full output comes first, every time.
+
+## CRITICAL: READ-ONLY — NEVER TAKE ACTION
+
+**This skill is STRICTLY read-only. You MUST NOT:**
+- Kill any process (no `kill`, `pkill`, or any signal)
+- Modify any harness state file (no writes to session.json, worker_assignments.json, etc.)
+- Remove worktrees or branches
+- Touch coordination files (claims, instances)
+- Run any harness commands (drain, stop, resume)
+
+**Agents routinely take 15-30 minutes per task.** This is NORMAL. A generator or evaluator
+running for 20+ minutes is NOT stuck — it is working. Do NOT kill agents based on elapsed time.
+
+Only the user can authorize destructive actions. If you suspect something is genuinely stuck,
+**report it and ask the user** — never act on your own.

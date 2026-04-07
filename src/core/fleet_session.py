@@ -12,14 +12,18 @@ from datetime import datetime, timezone
 from .state import atomic_write, atomic_read
 
 
-def _fleet_dir(state_dir: Path) -> Path:
-    """Return .harness/fleet/ directory (sibling of .harness/state/)."""
-    return state_dir.parent / "fleet"
+def fleet_dir(state_dir: Path) -> Path:
+    """Return fleet/ directory inside the run's state_dir.
+
+    Fleet state (session, briefs, wave results) is per-run — each run
+    tracks its own parallel execution independently.
+    """
+    return Path(state_dir) / "fleet"
 
 
 def _session_path(state_dir: Path) -> Path:
     """Return .harness/fleet/session.json path."""
-    return _fleet_dir(state_dir) / "session.json"
+    return fleet_dir(state_dir) / "session.json"
 
 
 def _default_session() -> dict:
@@ -52,11 +56,20 @@ def save_session(session: dict, state_dir: Path) -> None:
     atomic_write(_session_path(state_dir), session)
 
 
-def init_session(state_dir: Path, total_layers: int) -> dict:
-    """Initialize a new fleet session.
+def init_session(
+    state_dir: Path,
+    total_layers: int,
+    *,
+    already_completed: list[str] | None = None,
+    already_failed: list[str] | None = None,
+) -> dict:
+    """Initialize a new fleet session, pre-seeded with known state from work_plan.
 
-    Returns session dict with active status and empty queues.
-    Also persists the session to disk.
+    Pre-populating completed_features/failed_features ensures session.json is
+    consistent with work_plan.json from the moment it is written — even if a
+    previous session was killed mid-wave and left stale data on disk.
+
+    Returns session dict. Also persists to disk immediately.
     """
     session = {
         "status": "active",
@@ -67,8 +80,8 @@ def init_session(state_dir: Path, total_layers: int) -> dict:
         "requeued_features": [],
         "discoveries": [],
         "wave_results": {},
-        "completed_features": [],
-        "failed_features": [],
+        "completed_features": list(already_completed or []),
+        "failed_features": list(already_failed or []),
         "conflict_features": [],
     }
     save_session(session, state_dir)

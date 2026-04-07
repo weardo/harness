@@ -11,11 +11,18 @@ from typing import Optional
 
 @dataclass
 class CostTracker:
-    """Tracks cumulative costs across all harness agents."""
+    """Tracks cumulative costs and token usage across all harness agents."""
 
     planner: float = 0.0
     generator: float = 0.0
     evaluator: float = 0.0
+    input_tokens: int = 0          # uncached input only
+    output_tokens: int = 0
+    cache_read_tokens: int = 0     # input tokens read from cache
+    cache_creation_tokens: int = 0  # input tokens written to cache
+    total_duration_ms: int = 0
+    total_api_ms: int = 0
+    total_turns: int = 0
     _session_costs: list = field(default_factory=list)
     _feature_costs: dict = field(default_factory=dict)
 
@@ -23,8 +30,14 @@ class CostTracker:
     def total(self) -> float:
         return self.planner + self.generator + self.evaluator
 
-    def record(self, agent_type: str, cost_usd: float, usage: Optional[dict] = None) -> None:
-        """Record cost for an agent session."""
+    @property
+    def total_input_tokens(self) -> int:
+        """Total input = uncached + cache_read + cache_creation."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+
+    def record(self, agent_type: str, cost_usd: float, usage: Optional[dict] = None,
+               duration_ms: int = 0, duration_api_ms: int = 0, num_turns: int = 0) -> None:
+        """Record cost, tokens, and timing for an agent session."""
         if agent_type == "planner":
             self.planner += cost_usd
         elif agent_type == "generator":
@@ -32,10 +45,21 @@ class CostTracker:
         elif agent_type == "evaluator":
             self.evaluator += cost_usd
 
+        if usage:
+            self.input_tokens += usage.get("input_tokens", 0)
+            self.output_tokens += usage.get("output_tokens", 0)
+            self.cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+            self.cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
+        self.total_duration_ms += duration_ms
+        self.total_api_ms += duration_api_ms
+        self.total_turns += num_turns
+
         self._session_costs.append({
             "agent": agent_type,
             "cost_usd": cost_usd,
             "usage": usage,
+            "duration_ms": duration_ms,
+            "num_turns": num_turns,
         })
 
     def record_feature(self, feature_id: str, agent_type: str, cost_usd: float) -> None:
@@ -65,6 +89,15 @@ class CostTracker:
             "generator": round(self.generator, 4),
             "evaluator": round(self.evaluator, 4),
             "total": round(self.total, 4),
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "total_input_tokens": self.total_input_tokens,
+            "total_tokens": self.total_input_tokens + self.output_tokens,
+            "total_duration_ms": self.total_duration_ms,
+            "total_api_ms": self.total_api_ms,
+            "total_turns": self.total_turns,
             "feature_costs": {k: round(v, 4) for k, v in self._feature_costs.items()},
         }
 
@@ -75,17 +108,33 @@ class CostTracker:
         tracker.planner = data.get("planner", 0.0)
         tracker.generator = data.get("generator", 0.0)
         tracker.evaluator = data.get("evaluator", 0.0)
+        tracker.input_tokens = data.get("input_tokens", 0)
+        tracker.output_tokens = data.get("output_tokens", 0)
+        tracker.cache_read_tokens = data.get("cache_read_tokens", 0)
+        tracker.cache_creation_tokens = data.get("cache_creation_tokens", 0)
+        tracker.total_duration_ms = data.get("total_duration_ms", 0)
+        tracker.total_api_ms = data.get("total_api_ms", 0)
+        tracker.total_turns = data.get("total_turns", 0)
         tracker._feature_costs = data.get("feature_costs", {})
         return tracker
 
     def format_summary(self) -> str:
-        """Format a human-readable cost summary."""
+        """Format a human-readable cost and token summary."""
+        total_all = self.total_input_tokens + self.output_tokens
         lines = [
             f"Cost: ${self.total:.2f}",
             f"  Planner:   ${self.planner:.2f}",
             f"  Generator: ${self.generator:.2f}",
             f"  Evaluator: ${self.evaluator:.2f}",
+            f"Tokens: {total_all:,} total",
+            f"  Input:  {self.total_input_tokens:,} (uncached: {self.input_tokens:,} / cache read: {self.cache_read_tokens:,} / cache write: {self.cache_creation_tokens:,})",
+            f"  Output: {self.output_tokens:,}",
         ]
+        if self.cache_read_tokens or self.cache_creation_tokens:
+            cache_total = self.cache_read_tokens + self.cache_creation_tokens
+            hit_rate = (self.cache_read_tokens / cache_total * 100) if cache_total else 0
+            lines.append(f"  Cache hit rate: {hit_rate:.0f}%")
+        lines.append(f"API time: {self.total_api_ms / 1000:.1f}s across {self.total_turns} turns")
         if self._feature_costs:
             lines.append("Per-feature costs:")
             for fid, cost in sorted(self._feature_costs.items(), key=lambda x: x[1], reverse=True):

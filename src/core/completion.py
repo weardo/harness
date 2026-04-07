@@ -10,17 +10,24 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from .state import StateManager
+from .state import StateManager, RunRegistry
 
 
-def check_completion(harness_dir: Path, test_command: Optional[str] = None) -> dict:
+def check_completion(harness_dir: Path, test_command: Optional[str] = None, state_dir: Optional[Path] = None) -> dict:
     """Check whether all completion criteria are met.
 
     Returns {complete: bool, reason: str, progress: bool}.
     Used by both Mode A orchestrator and Mode B Stop hook.
+
+    If state_dir is provided, uses it directly. Otherwise finds the latest
+    run via RunRegistry, falling back to legacy .harness/state/.
     """
     harness_dir = Path(harness_dir)
-    state_mgr = StateManager(harness_dir / "state")
+    if state_dir is None:
+        state_dir = _find_active_state_dir(harness_dir)
+    if state_dir is None:
+        return {"complete": False, "reason": "No harness state found", "progress": False}
+    state_mgr = StateManager(state_dir)
 
     # Check 1: Feature list — all features must be passing or blocked
     counts = state_mgr.count_features()
@@ -188,3 +195,27 @@ def run_test_suite(command: str, cwd: Path) -> dict:
             "output": "Test command not found, skipping",
             "returncode": 0,
         }
+
+
+def _find_active_state_dir(harness_dir: Path) -> Optional[Path]:
+    """Find the state directory for the active run.
+
+    Checks RunRegistry first (new format), falls back to legacy state/ dir.
+    """
+    try:
+        registry = RunRegistry(harness_dir)
+        resumable = registry.find_resumable()
+        if resumable:
+            return registry.run_dir(resumable)
+        # No in_progress run — try the most recent one
+        runs = registry.list_runs()
+        if runs:
+            return registry.run_dir(runs[-1]["run_id"])
+    except Exception:
+        pass
+
+    # Fall back to legacy path
+    legacy = harness_dir / "state"
+    if legacy.is_dir():
+        return legacy
+    return None

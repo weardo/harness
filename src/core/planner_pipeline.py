@@ -16,12 +16,23 @@ Event IDs use "planner-{role}" prefix for dashboard display.
 """
 
 import json
+import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .state import atomic_write, atomic_read
 from .client import create_client_options, load_config
+
+
+def _write_planner_log(state_dir: Path, event: str, **data) -> None:
+    """Append a timestamped entry to logs/planner.jsonl."""
+    log_dir = state_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **data}
+    with open(log_dir / "planner.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def validate_json_array(
@@ -371,6 +382,99 @@ def _validate_artifact(role: dict, state_dir: Path) -> dict:
     return {"valid": True}
 
 
+def _artifact_size(state_dir: Path, artifact: str) -> int:
+    """Get size of an artifact file in bytes."""
+    path = Path(state_dir) / artifact
+    return path.stat().st_size if path.exists() else 0
+
+
+def _is_role_complete(planner_state: dict, role_name: str) -> bool:
+    """Check if a role has a 'complete' entry in the structured state."""
+    for role in planner_state.get("roles", []):
+        if role["name"] == role_name and role["status"] == "complete":
+            return True
+    return False
+
+
+async def _run_refiner_fix(
+    issues: list,
+    roles: list,
+    state_dir: Path,
+    project_dir: Path,
+    config: dict,
+    state_mgr,
+    cost_tracker,
+    event_tracker=None,
+    triggered_by: str = "",
+) -> float:
+    """Run a refiner-fix session to address validator issues. Returns cost."""
+    from .orchestrator import run_agent_session  # noqa: PLC0415
+
+    refiner_role = next((r for r in roles if r.get("name") == "refiner"), None)
+    if not refiner_role:
+        return 0.0
+
+    issues_json = json.dumps(issues, indent=2)
+    fix_prompt = (
+        "# Fix Validator Issues in work_plan.json\n\n"
+        "The Validator found issues in the work plan. Fix them by modifying work_plan.json.\n\n"
+        "## Issues to fix:\n\n"
+        f"```json\n{issues_json}\n```\n\n"
+        "## Instructions:\n\n"
+        "1. Read the current work_plan.json from the state directory\n"
+        "2. Apply each fix (usually adding depends_on entries to serialize shared-file access)\n"
+        "3. Write the updated work_plan.json back\n"
+        "4. Do NOT change task descriptions, acceptance_criteria, or steps — only fix the issues listed\n\n"
+        f"State directory: {state_dir}\n"
+    )
+
+    model = _resolve_model(refiner_role.get("model", "sonnet"), config)
+
+    if event_tracker:
+        event_tracker.planner_role_start("refiner-fix", f"Fixing {len(issues)} validator issues")
+
+    state_mgr.start_role("refiner-fix", model=model, triggered_by=triggered_by)
+
+    fix_options = create_client_options(project_dir, config, model_override=model)
+    fix_result = await run_agent_session(
+        fix_prompt, fix_options, Path(project_dir),
+        progress_label="Planner/refiner-fix"
+    )
+    fix_cost = fix_result.get("cost", 0.0)
+    cost_tracker.record("planner", fix_cost,
+                        usage=fix_result.get("usage") or {},
+                        duration_ms=fix_result.get("duration_ms", 0),
+                        duration_api_ms=fix_result.get("duration_api_ms", 0),
+                        num_turns=fix_result.get("num_turns", 0))
+
+    state_mgr.complete_role(
+        "refiner-fix",
+        cost_usd=fix_cost,
+        artifact="work_plan.json",
+        artifact_size_bytes=_artifact_size(state_dir, "work_plan.json"),
+    )
+    state_mgr.increment_fix_loops()
+
+    print(f"  refiner-fix: complete. Cost: ${fix_cost:.2f}")
+
+    # Archive old validation for debugging history, then remove so Validator runs fresh
+    validation_path = state_dir / "validation.json"
+    if validation_path.exists():
+        artifacts_dir = state_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        iteration = state_mgr.get_planner_state().get("fix_loops_completed", 0)
+        archive_name = f"validation.iter-{iteration}.json"
+        shutil.copy2(str(validation_path), str(artifacts_dir / archive_name))
+        _write_planner_log(state_dir, "validation_archived",
+                           iteration=iteration, archive=archive_name)
+        validation_path.unlink()
+
+    if event_tracker:
+        event_tracker.planner_role_pass("refiner-fix", "work_plan.json", 0)
+
+    return fix_cost
+
+
 async def run_planner_pipeline(  # noqa: C901
     strategy_config: dict,
     prompts_dir: Path,
@@ -388,6 +492,9 @@ async def run_planner_pipeline(  # noqa: C901
     Loops through strategy_config["planner_roles"], running each role as a
     separate agent session. Validates artifacts between roles. Supports resume.
 
+    Uses structured planner state machine for tracking. Auto-migrates legacy
+    planner_roles dict format.
+
     Returns:
         {"success": bool, "roles_completed": list[str], "total_cost": float}
     """
@@ -398,65 +505,45 @@ async def run_planner_pipeline(  # noqa: C901
     roles_completed = []
     total_cost = 0.0
 
-    # Load resume state (feature 030-031)
-    state = state_mgr.load_state()
-    planner_roles_done = state.get("planner_roles", {})  # default {} if missing (031)
+    # Auto-migrate legacy planner_roles dict if present
+    state_mgr.migrate_legacy_planner_state()
 
-    # Pre-loop: if resuming and validator previously rejected, fix work_plan before re-running validator
-    validation_path = state_dir / "validation.json"
-    if planner_roles_done.get("refiner") and not planner_roles_done.get("validator") and validation_path.exists():
-        try:
-            import json as _json
-            validation_data = _json.loads(validation_path.read_text())
-            if not validation_data.get("sign_off") and validation_data.get("issues"):
-                issues = validation_data["issues"]
-                print(f"\n  Previous Validator rejected ({len(issues)} issues) — running Refiner-fix first...")
+    # Initialize planner state machine
+    ps = state_mgr.get_planner_state()
+    if ps["status"] == "pending":
+        state_mgr.start_planner()
 
-                if event_tracker:
-                    event_tracker.planner_role_start("refiner-fix", f"Fixing {len(issues)} validator issues")
+    # Resume: check if we need to handle a crashed or rejected state
+    resume_point = state_mgr.get_resume_point()
 
-                from .orchestrator import run_agent_session  # noqa: PLC0415
-
-                refiner_role = next((r for r in roles if r.get("name") == "refiner"), None)
-                if refiner_role:
-                    issues_json = _json.dumps(issues, indent=2)
-                    fix_prompt = (
-                        "# Fix Validator Issues in work_plan.json\n\n"
-                        "The Validator found issues in the work plan. Fix them by modifying work_plan.json.\n\n"
-                        "## Issues to fix:\n\n"
-                        f"```json\n{issues_json}\n```\n\n"
-                        "## Instructions:\n\n"
-                        "1. Read the current work_plan.json from the state directory\n"
-                        "2. Apply each fix (usually adding depends_on entries to serialize shared-file access)\n"
-                        "3. Write the updated work_plan.json back\n"
-                        "4. Do NOT change task descriptions, acceptance_criteria, or steps — only fix the issues listed\n\n"
-                        f"State directory: {state_dir}\n"
+    if resume_point["action"] == "fix_loop":
+        # Validator previously rejected — run refiner-fix before continuing
+        validation_path = state_dir / "validation.json"
+        if validation_path.exists():
+            try:
+                validation_data = json.loads(validation_path.read_text())
+                issues = validation_data.get("issues", [])
+                if issues:
+                    validator_attempt = sum(
+                        1 for r in ps["roles"] if r["name"] == "validator"
                     )
-                    model = _resolve_model(refiner_role.get("model", "sonnet"), config)
-                    fix_options = create_client_options(project_dir, config, model_override=model)
-                    fix_result = await run_agent_session(
-                        fix_prompt, fix_options, Path(project_dir),
-                        progress_label="Planner/refiner-fix"
+                    print(f"\n  Previous Validator rejected ({len(issues)} issues) — running Refiner-fix first...")
+                    fix_cost = await _run_refiner_fix(
+                        issues, roles, state_dir, project_dir, config,
+                        state_mgr, cost_tracker, event_tracker,
+                        triggered_by=f"validator:attempt:{validator_attempt}",
                     )
-                    fix_cost = fix_result.get("cost", 0.0)
                     total_cost += fix_cost
-                    cost_tracker.record("planner", fix_cost)
-                    print(f"  refiner-fix: complete. Cost: ${fix_cost:.2f}")
-
-                    # Remove old validation so Validator runs fresh
-                    validation_path.unlink(missing_ok=True)
-
-                    if event_tracker:
-                        event_tracker.planner_role_pass("refiner-fix", "work_plan.json", 0)
-        except Exception as e:
-            print(f"  Refiner-fix pre-loop failed (non-fatal): {e}")
+            except Exception as e:
+                print(f"  Refiner-fix pre-loop failed (non-fatal): {e}")
 
     for role in roles:
         role_name = role.get("name", "")
         artifact = role.get("artifact", "")
 
-        # Resume: skip already-completed roles (feature 030)
-        if planner_roles_done.get(role_name):
+        # Resume: skip already-completed roles
+        ps = state_mgr.get_planner_state()
+        if _is_role_complete(ps, role_name):
             print(f"  [{role_name}] skipped (already complete)")
             roles_completed.append(role_name)
             continue
@@ -467,7 +554,9 @@ async def run_planner_pipeline(  # noqa: C901
                 role_name, f"Producing {artifact}"
             )
 
-        # Update state: current role in progress (feature 030)
+        # Record role start in state machine
+        model = _resolve_model(role.get("model", "sonnet"), config)
+        state_mgr.start_role(role_name, model=model)
         state_mgr.update_state(current_planner_role=role_name)
 
         # Lazy imports to avoid circular dependency with orchestrator
@@ -479,30 +568,61 @@ async def run_planner_pipeline(  # noqa: C901
         context = _build_role_context(role, state_dir, knowledge_section, input_section)
         full_prompt = base_prompt + context
 
-        # Resolve model (feature 028)
-        model = _resolve_model(role.get("model", "sonnet"), config)
         options = create_client_options(project_dir, config, model_override=model)
 
-        # Run agent session (feature 026)
+        # Run agent session
         t_start = time.time()
         result = await run_agent_session(full_prompt, options, Path(project_dir), progress_label=f"Planner/{role_name}")
         duration_ms = int((time.time() - t_start) * 1000)
         cost = result.get("cost", 0.0)
+        result_usage = result.get("usage") or {}
+        sdk_duration_ms = result.get("duration_ms", 0)
         total_cost += cost
-        cost_tracker.record("planner", cost)
+        cost_tracker.record("planner", cost,
+                            usage=result_usage,
+                            duration_ms=sdk_duration_ms,
+                            duration_api_ms=result.get("duration_api_ms", 0),
+                            num_turns=result.get("num_turns", 0))
 
         print(f"  {role_name}: complete. Cost: ${cost:.2f}. Artifact: {artifact}")
+        _write_planner_log(state_dir, "role_complete",
+                           role=role_name, artifact=artifact,
+                           cost_usd=cost, duration_ms=sdk_duration_ms,
+                           input_tokens=result_usage.get("input_tokens", 0),
+                           output_tokens=result_usage.get("output_tokens", 0),
+                           num_turns=result.get("num_turns", 0))
 
-        # Validation gate (feature 029)
+        # Validation gate
         validation_result = _validate_artifact(role, state_dir)
         if not validation_result.get("valid"):
             reason = validation_result.get("reason", "validation failed")
+
+            # Validator rejection (sign_off: false) goes to refiner-fix, not a same-role retry.
+            # Only the refiner-fix can actually modify the work plan to address issues.
+            if role_name == "validator" and validation_result.get("issues"):
+                print(f"  [{role_name}] REJECTED: {reason}")
+                artifact_bytes = _artifact_size(state_dir, artifact)
+                state_mgr.reject_role(
+                    role_name,
+                    cost_usd=cost,
+                    artifact=artifact,
+                    validation=validation_result,
+                )
+                roles_completed.append(role_name)
+                if event_tracker:
+                    event_tracker.planner_role_reject(
+                        role_name,
+                        issues_count=len(validation_result["issues"]),
+                        cost_usd=cost,
+                    )
+                continue  # Skip to post-loop where refiner-fix handles it
+
+            # Non-validator roles: retry once with feedback
             print(f"  [{role_name}] validation failed: {reason}. Retrying...")
 
             if event_tracker:
                 event_tracker.planner_role_retry(role_name)
 
-            # Build retry prompt with feedback
             artifact_content = _read_artifact(state_dir, artifact)
             retry_prompt = (
                 full_prompt
@@ -512,76 +632,62 @@ async def run_planner_pipeline(  # noqa: C901
             retry_result = await run_agent_session(retry_prompt, retry_options, Path(project_dir), progress_label=f"Planner/{role_name} (retry)")
             retry_cost = retry_result.get("cost", 0.0)
             total_cost += retry_cost
-            cost_tracker.record("planner", retry_cost)
+            cost_tracker.record("planner", retry_cost,
+                                usage=retry_result.get("usage") or {},
+                                duration_ms=retry_result.get("duration_ms", 0),
+                                duration_api_ms=retry_result.get("duration_api_ms", 0),
+                                num_turns=retry_result.get("num_turns", 0))
 
             retry_validation = _validate_artifact(role, state_dir)
             if retry_validation.get("valid"):
                 print(f"  [{role_name}] retry succeeded. Cost: ${retry_cost:.2f}")
+                validation_result = retry_validation
             else:
                 print(f"  [{role_name}] retry also failed — proceeding anyway")
+                validation_result = retry_validation
                 if event_tracker:
                     event_tracker.planner_role_fail(role_name, retry_validation.get("reason", ""))
 
-        # Mark role complete in state (feature 030)
-        planner_roles_done[role_name] = True
-        state_mgr.update_state(planner_roles=planner_roles_done)
+        # Record role completion in state machine
+        artifact_bytes = _artifact_size(state_dir, artifact)
+        state_mgr.complete_role(
+            role_name,
+            cost_usd=cost,
+            artifact=artifact,
+            artifact_size_bytes=artifact_bytes,
+            validation=validation_result,
+        )
         roles_completed.append(role_name)
 
         if event_tracker:
             event_tracker.planner_role_pass(role_name, artifact, duration_ms)
 
-    # Validator → Refiner feedback loop: if validator rejected, re-run refiner with issues
+    # Post-loop: Validator → Refiner feedback loop (state-machine driven)
     validation_path = state_dir / "validation.json"
     if validation_path.exists():
         try:
-            import json as _json
-            validation_data = _json.loads(validation_path.read_text())
+            validation_data = json.loads(validation_path.read_text())
             if not validation_data.get("sign_off") and validation_data.get("issues"):
                 issues = validation_data["issues"]
-                print(f"\n  Validator rejected ({len(issues)} issues) — re-running Refiner to fix...")
-
-                if event_tracker:
-                    event_tracker.planner_role_start("refiner-fix", f"Fixing {len(issues)} validator issues")
-
-                # Find the refiner role config
-                refiner_role = next((r for r in roles if r.get("name") == "refiner"), None)
-                if refiner_role:
-                    from .orchestrator import run_agent_session, load_prompt
-
-                    # Build a targeted fix prompt — only the issues, not full context
-                    issues_json = _json.dumps(issues, indent=2)
-                    work_plan_content = _read_artifact(state_dir, "work_plan.json")
-
-                    fix_prompt = (
-                        "# Fix Validator Issues in work_plan.json\n\n"
-                        "The Validator found issues in the work plan. Fix them by modifying work_plan.json.\n\n"
-                        "## Issues to fix:\n\n"
-                        f"```json\n{issues_json}\n```\n\n"
-                        "## Instructions:\n\n"
-                        "1. Read the current work_plan.json from the state directory\n"
-                        "2. Apply each fix (usually adding depends_on entries to serialize shared-file access)\n"
-                        "3. Write the updated work_plan.json back\n"
-                        "4. Do NOT change task descriptions, acceptance_criteria, or steps — only fix the issues listed\n\n"
-                        f"State directory: {state_dir}\n"
+                ps = state_mgr.get_planner_state()
+                if ps["fix_loops_completed"] < ps["max_fix_loops"]:
+                    validator_attempt = sum(
+                        1 for r in ps["roles"] if r["name"] == "validator"
                     )
-
-                    model = _resolve_model(refiner_role.get("model", "sonnet"), config)
-                    fix_options = create_client_options(project_dir, config, model_override=model)
-                    fix_result = await run_agent_session(
-                        fix_prompt, fix_options, Path(project_dir),
-                        progress_label="Planner/refiner-fix"
+                    print(f"\n  Validator rejected ({len(issues)} issues) — re-running Refiner to fix...")
+                    fix_cost = await _run_refiner_fix(
+                        issues, roles, state_dir, project_dir, config,
+                        state_mgr, cost_tracker, event_tracker,
+                        triggered_by=f"validator:attempt:{validator_attempt}",
                     )
-                    fix_cost = fix_result.get("cost", 0.0)
                     total_cost += fix_cost
-                    cost_tracker.record("planner", fix_cost)
-                    print(f"  refiner-fix: complete. Cost: ${fix_cost:.2f}")
-
-                    if event_tracker:
-                        event_tracker.planner_role_pass("refiner-fix", "work_plan.json", 0)
+                else:
+                    print(f"  Validator rejected but max fix loops ({ps['max_fix_loops']}) reached — proceeding with warning")
         except Exception as e:
             print(f"  Validator feedback loop failed (non-fatal): {e}")
 
-    # All roles done → mark pipeline complete (feature 030)
+    # All roles done — mark pipeline complete
+    state_mgr.complete_planner()
     state_mgr.update_state(planner_complete=True)
 
     if event_tracker:

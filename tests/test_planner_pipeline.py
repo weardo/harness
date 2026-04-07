@@ -506,7 +506,8 @@ class TestPipelineModelResolution:
 class TestPipelineResume:
     """Feature 030: resume support — pre-completed roles are skipped."""
 
-    def test_skips_completed_role(self, tmp_dir):
+    def test_skips_completed_role_structured(self, tmp_dir):
+        """Resume uses structured planner state to skip completed roles."""
         state_dir = tmp_dir / "state"
         state_dir.mkdir()
         prompts_dir = tmp_dir / "prompts"
@@ -519,7 +520,52 @@ class TestPipelineResume:
         write_valid_artifacts(state_dir)
 
         state_mgr = StateManager(state_dir)
-        # Pre-mark architect as done
+        # Pre-mark architect as done using structured state
+        state_mgr.start_planner()
+        state_mgr.start_role("architect", model="opus")
+        state_mgr.complete_role("architect", cost_usd=1.0, artifact="draft_work_plan.json")
+
+        run_calls = []
+
+        async def mock_run(prompt, options, project_dir, **kwargs):
+            run_calls.append(True)
+            return make_mock_agent_result()
+
+        with patch("src.core.orchestrator.run_agent_session", new=mock_run), \
+             patch("src.core.planner_pipeline.create_client_options", return_value={}):
+            result = asyncio.run(
+                run_planner_pipeline(
+                    strategy_config=make_strategy_config(),
+                    prompts_dir=prompts_dir,
+                    project_dir=project_dir,
+                    state_dir=state_dir,
+                    state_mgr=state_mgr,
+                    cost_tracker=MagicMock(),
+                    knowledge_section="",
+                    input_section="",
+                    config=make_config(),
+                )
+            )
+
+        # Architect was skipped, so only 3 calls
+        assert len(run_calls) == 3
+        assert "architect" in result["roles_completed"]
+
+    def test_skips_completed_role_legacy(self, tmp_dir):
+        """Resume auto-migrates old planner_roles dict and skips completed roles."""
+        state_dir = tmp_dir / "state"
+        state_dir.mkdir()
+        prompts_dir = tmp_dir / "prompts"
+        prompts_dir.mkdir()
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+
+        for name in ["architect.md", "adversary.md", "refiner.md", "validator.md"]:
+            (prompts_dir / name).write_text("prompt")
+        write_valid_artifacts(state_dir)
+
+        state_mgr = StateManager(state_dir)
+        # Pre-mark architect as done using OLD format
         state_mgr.update_state(planner_roles={"architect": True})
 
         run_calls = []
@@ -580,6 +626,47 @@ class TestPipelineResume:
 
         state = state_mgr.load_state()
         assert state["planner_complete"] is True
+
+    def test_pipeline_records_structured_state(self, tmp_dir):
+        """Pipeline records timestamps, costs, and artifacts in planner.roles[]."""
+        state_dir = tmp_dir / "state"
+        state_dir.mkdir()
+        prompts_dir = tmp_dir / "prompts"
+        prompts_dir.mkdir()
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+
+        for name in ["architect.md", "adversary.md", "refiner.md", "validator.md"]:
+            (prompts_dir / name).write_text("prompt")
+        write_valid_artifacts(state_dir)
+
+        state_mgr = StateManager(state_dir)
+
+        with patch("src.core.orchestrator.run_agent_session", new=AsyncMock(return_value=make_mock_agent_result(cost=0.5))), \
+             patch("src.core.planner_pipeline.create_client_options", return_value={}):
+            asyncio.run(
+                run_planner_pipeline(
+                    strategy_config=make_strategy_config(),
+                    prompts_dir=prompts_dir,
+                    project_dir=project_dir,
+                    state_dir=state_dir,
+                    state_mgr=state_mgr,
+                    cost_tracker=MagicMock(),
+                    knowledge_section="",
+                    input_section="",
+                    config=make_config(),
+                )
+            )
+
+        ps = state_mgr.get_planner_state()
+        assert ps["status"] == "complete"
+        assert len(ps["roles"]) == 4
+        for role in ps["roles"]:
+            assert role["status"] == "complete"
+            assert role["started_at"] is not None
+            assert role["completed_at"] is not None
+            assert role["cost_usd"] == pytest.approx(0.5)
+            assert role["attempt"] == 1
 
 
 class TestPipelineLegacyState:
@@ -690,6 +777,104 @@ class TestPipelineRetry:
 
         # Should have run twice: initial + retry
         assert run_count[0] == 2
+
+    def test_validator_rejection_skips_retry_goes_to_refiner_fix(self, tmp_dir):
+        """Validator sign_off:false → reject_role (not retry), then refiner-fix in post-loop."""
+        state_dir = tmp_dir / "state"
+        state_dir.mkdir()
+        prompts_dir = tmp_dir / "prompts"
+        prompts_dir.mkdir()
+        project_dir = tmp_dir / "project"
+        project_dir.mkdir()
+
+        # Validator with validation type that checks sign_off.
+        # Refiner role needed so _run_refiner_fix can resolve its model.
+        single_config = {
+            "planner_roles": [
+                {
+                    "name": "refiner",
+                    "model": "sonnet",
+                    "prompt": "refiner.md",
+                    "artifact": "work_plan.json",
+                    "validation": {"type": "work_plan", "min_tasks": 1, "min_phases": 1},
+                },
+                {
+                    "name": "validator",
+                    "model": "opus",
+                    "prompt": "validator.md",
+                    "artifact": "validation.json",
+                    "validation": {"type": "validation", "require_sign_off": True},
+                },
+            ]
+        }
+        (prompts_dir / "refiner.md").write_text("refiner prompt {{STATE_DIR}}")
+        (prompts_dir / "validator.md").write_text("validator prompt {{STATE_DIR}}")
+        (state_dir / "spec.md").write_text("## Spec")
+        (state_dir / "work_plan.json").write_text(json.dumps(make_work_plan(n_tasks=2)))
+        (state_dir / "spec_gaps.json").write_text('{"gaps": []}')
+
+        run_count = [0]
+        run_labels = []
+
+        async def mock_run(prompt, options, project_dir, **kwargs):
+            run_count[0] += 1
+            run_labels.append(kwargs.get("progress_label", ""))
+            # Validator always writes sign_off: false
+            (state_dir / "validation.json").write_text(json.dumps({
+                "sign_off": False,
+                "issues": [
+                    {"title": "Missing error handling", "severity": "critical"},
+                    {"title": "No test coverage", "severity": "major"},
+                ],
+            }))
+            return make_mock_agent_result()
+
+        state_mgr = StateManager(state_dir)
+        # Pre-mark refiner complete so it's skipped in the loop
+        state_mgr.start_planner()
+        state_mgr.start_role("refiner", model="sonnet")
+        state_mgr.complete_role("refiner", cost_usd=0.0, artifact="work_plan.json")
+
+        with patch("src.core.orchestrator.run_agent_session", new=mock_run), \
+             patch("src.core.planner_pipeline.create_client_options", return_value={}):
+            asyncio.run(
+                run_planner_pipeline(
+                    strategy_config=single_config,
+                    prompts_dir=prompts_dir,
+                    project_dir=project_dir,
+                    state_dir=state_dir,
+                    state_mgr=state_mgr,
+                    cost_tracker=MagicMock(),
+                    knowledge_section="",
+                    input_section="",
+                    config=make_config(),
+                )
+            )
+
+        # Validator runs once (NOT retried), then refiner-fix runs in post-loop
+        assert run_count[0] == 2  # validator + refiner-fix
+        assert "Planner/validator" in run_labels[0]
+        assert "Planner/refiner-fix" in run_labels[1]
+
+        # State machine: validator is rejected, not complete
+        ps = state_mgr.get_planner_state()
+        validator_roles = [r for r in ps["roles"] if r["name"] == "validator"]
+        assert validator_roles[0]["status"] == "rejected"
+
+        # Fix loop was used
+        assert ps["fix_loops_completed"] == 1
+
+        # Validation archived before deletion
+        artifacts_dir = state_dir / "artifacts"
+        assert artifacts_dir.exists()
+        archived = list(artifacts_dir.glob("validation.iter-*.json"))
+        assert len(archived) >= 1
+        archived_data = json.loads(archived[0].read_text())
+        assert archived_data["sign_off"] is False
+
+        # Planner log written
+        log_file = state_dir / "logs" / "planner.jsonl"
+        assert log_file.exists()
 
 
 # ---------------------------------------------------------------------------

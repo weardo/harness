@@ -7,12 +7,13 @@ cost tracking, progress detection, and resume support.
 """
 
 import asyncio
+import json as json_mod
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .state import StateManager
+from .state import StateManager, RunRegistry
 from .circuit_breaker import CircuitBreaker, hash_error
 from .completion import check_completion, check_exit_conditions, check_suspicion
 from .cost_tracker import CostTracker
@@ -23,17 +24,43 @@ from .worktree import sweep_merged_worktrees
 from .planner_pipeline import run_planner_pipeline
 from .work_plan import WorkPlan
 from .event_tracker import EventTracker
-from .parallel import group_by_dependency, create_worktree, merge_worktree, cleanup_worktree
+from .parallel import (
+    group_by_dependency, create_worktree, merge_worktree, cleanup_worktree,
+    branch_has_commits, _init_submodules_local, write_task_brief,
+)
 from .coordination import (
     generate_instance_id, register_instance, unregister_instance,
     claim_scope, sweep_stale_instances, get_swept_feature_ids, ScopeOverlapError,
 )
 from .discovery import parse_handoff, compress_discovery, write_brief, get_relay_context
 from . import fleet_session
+from . import worker_assignments
 
 
 # Delay between sessions
 AUTO_CONTINUE_DELAY = 3
+
+# Active worker subprocesses — signal handler uses this for hard stop
+_active_worker_procs: set = set()
+
+# Shutdown flag — set by signal handler or drain file
+_shutdown_requested = False
+
+
+def _check_drain(state_dir: Path) -> bool:
+    """Check if a graceful drain has been requested via drain file.
+
+    The drain file is written by /harness-stop to request a clean shutdown
+    after current generators + evaluators finish. Returns True if draining.
+    """
+    drain_file = state_dir / "drain"
+    return drain_file.exists()
+
+
+def _clear_drain(state_dir: Path) -> None:
+    """Remove drain file after shutdown completes."""
+    drain_file = state_dir / "drain"
+    drain_file.unlink(missing_ok=True)
 
 # Delegation mode prompt mapping
 _DELEGATION_PROMPTS = {
@@ -41,6 +68,135 @@ _DELEGATION_PROMPTS = {
     "guided": {"architect": "architect-guided.md", "generator": "generator-guided.md"},
     "outcome-only": {"architect": "architect-outcome.md", "generator": "generator-outcome.md"},
 }
+
+
+def _metrics_from(result: dict) -> dict:
+    """Extract token/timing metrics from an agent session result for cost_tracker.record()."""
+    return {
+        "usage": result.get("usage") or {},
+        "duration_ms": result.get("duration_ms", 0),
+        "duration_api_ms": result.get("duration_api_ms", 0),
+        "num_turns": result.get("num_turns", 0),
+    }
+
+
+def _write_run_log(state_dir: Path, event: str, **data) -> None:
+    """Append a timestamped JSON entry to logs/run.jsonl. Never raises."""
+    try:
+        log_dir = state_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **data,
+        }
+        with open(log_dir / "run.jsonl", "a") as f:
+            f.write(json_mod.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _log_error(state_dir: Path, context: str, exc: Exception) -> None:
+    """Append error event with full traceback to the unified run.jsonl. Never raises."""
+    import traceback
+    _write_run_log(state_dir, "error",
+                   context=context,
+                   error=str(exc),
+                   error_type=type(exc).__name__,
+                   traceback=traceback.format_exc())
+
+
+def _build_eval_replacements(
+    feature_id: str,
+    state_dir: Path,
+    config: dict,
+    test_command: str,
+    work_plan=None,
+    retry_count: int = 1,
+) -> tuple[dict, str, str, str]:
+    """Build evaluator system prompt replacements and user message.
+
+    Returns (system_replacements, preferred_file, fallback_file, user_message).
+    System replacements are wave-constant (cacheable).
+    User message contains feature-specific details (dynamic).
+    """
+    feature_desc = feature_id
+    ac_text = ""
+    if work_plan:
+        for ph in work_plan.data.get("phases", []):
+            for ep in ph.get("epics", []):
+                for st in ep.get("stories", []):
+                    for t in st.get("tasks", []):
+                        if t.get("id") == feature_id:
+                            feature_desc = t.get("description", feature_id)
+                            ac = t.get("acceptance_criteria", t.get("ac", ""))
+                            if isinstance(ac, list):
+                                ac_text = "\n".join(f"- {a}" for a in ac)
+                            elif ac:
+                                ac_text = ac
+
+    # System prompt replacements (mostly static, cacheable across features in a wave).
+    # NOTE: RETRY_COUNT varies per retry attempt, which defeats caching on retries.
+    # Acceptable trade-off: retries are rare and typically outside the 5-min cache TTL anyway.
+    system_replacements = {
+        "STATE_DIR": str(state_dir),
+        "TEST_COMMAND": test_command,
+        "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
+        "RETRY_COUNT": str(retry_count),
+        "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
+    }
+
+    # User message (dynamic, per-feature)
+    user_msg_parts = [
+        f"Feature ID: {feature_id}",
+        f"Description: {feature_desc}",
+    ]
+    if ac_text:
+        user_msg_parts.append(f"\nAcceptance Criteria:\n{ac_text}")
+    user_message = "\n".join(user_msg_parts)
+
+    return system_replacements, "evaluator-v2.md", "evaluator.md", user_message
+
+
+def _reset_feature_passes(state_dir: Path, feature_id: str) -> None:
+    """Safety net: reset passes=True on gen/eval failure.
+
+    Only the orchestrator should mark passes=True (after eval pass + merge).
+    This catches edge cases where older generator prompts or race conditions
+    leave orphaned passes=True that prevents re-dispatch.
+    """
+    fl_path = state_dir / "feature_list.json"
+    try:
+        fl = json_mod.loads(fl_path.read_text())
+        for f in fl:
+            if f.get("id") == feature_id and f.get("passes"):
+                f["passes"] = False
+                fl_path.write_text(json_mod.dumps(fl, indent=2))
+                break
+    except Exception:
+        pass  # Non-fatal
+
+
+def _build_qa_user_msg(feature_id: str, work_plan=None) -> str:
+    """Build QA user message with feature details from work_plan."""
+    feature_desc = feature_id
+    ac_text = ""
+    if work_plan:
+        for ph in work_plan.data.get("phases", []):
+            for ep in ph.get("epics", []):
+                for st in ep.get("stories", []):
+                    for t in st.get("tasks", []):
+                        if t.get("id") == feature_id:
+                            feature_desc = t.get("description", feature_id)
+                            ac = t.get("acceptance_criteria", t.get("ac", ""))
+                            if isinstance(ac, list):
+                                ac_text = "\n".join(f"- {a}" for a in ac)
+                            elif ac:
+                                ac_text = ac
+    parts = [f"Feature ID: {feature_id}", f"Description: {feature_desc}"]
+    if ac_text:
+        parts.append(f"\nAcceptance Criteria:\n{ac_text}")
+    return "\n".join(parts)
 
 
 def resolve_prompt(role: str, config: dict) -> str:
@@ -81,31 +237,89 @@ def process_conditionals(text: str, context: dict) -> str:
     return text
 
 
+RATE_LIMIT_WAIT_SECONDS = 300  # 5 minutes between rate limit retries
+RATE_LIMIT_MAX_RETRIES = 3
+
+
 async def run_agent_session(
     prompt: str,
     options: dict,
     project_dir: Path,
     progress_label: str = "",
+    system_prompt: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
 ) -> dict:
     """Run a single agent session using Claude Agent SDK.
 
     Falls back to `claude -p` CLI if no ANTHROPIC_API_KEY is set,
     allowing the harness to run on a Claude subscription without a key.
 
+    Handles rate limiting automatically: on rate limit, waits and resumes
+    the same session (preserving full conversation context). Retries up to
+    RATE_LIMIT_MAX_RETRIES times before returning the rate_limited result.
+
     Args:
+        prompt: User message (dynamic, per-feature content).
         progress_label: If set, print streaming progress markers (e.g., "Planner").
+        system_prompt: Static template passed via --system-prompt for caching.
+        resume_session_id: If set, resume a previous session instead of starting fresh.
+            The agent keeps full conversation history from the prior run.
 
     Returns {status, output, cost, usage, session_id}.
     """
+    # Copy options to prevent mutation (SDK path pops "hooks" key)
+    _opts = dict(options)
+    result = await _run_agent_session_inner(prompt, _opts, project_dir,
+                                            progress_label, system_prompt, resume_session_id)
+
+    # Rate limit retry loop: wait and resume the same session
+    for _rl in range(RATE_LIMIT_MAX_RETRIES):
+        if result.get("status") != "rate_limited":
+            return result
+        _sid = result.get("session_id") or resume_session_id
+        _wait = RATE_LIMIT_WAIT_SECONDS
+        print(f"  Rate limited ({_rl + 1}/{RATE_LIMIT_MAX_RETRIES}). Waiting {_wait // 60}m...")
+        print(f"    {result.get('output', '')[:120]}")
+        await asyncio.sleep(_wait)
+        _opts = dict(options)  # fresh copy each retry (SDK path mutates)
+        if _sid:
+            # Resume the same session — agent keeps full context
+            result = await _run_agent_session_inner(
+                "You were rate limited. Continue where you left off.",
+                _opts, project_dir, progress_label,
+                system_prompt=None, resume_session_id=_sid)
+        else:
+            # No session to resume — retry fresh
+            result = await _run_agent_session_inner(
+                prompt, _opts, project_dir, progress_label,
+                system_prompt, resume_session_id=None)
+
+    return result
+
+
+async def _run_agent_session_inner(
+    prompt: str,
+    options: dict,
+    project_dir: Path,
+    progress_label: str = "",
+    system_prompt: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+) -> dict:
+    """Inner session runner — no rate limit retry (handled by caller)."""
     import os
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        return await run_agent_session_cli(prompt, project_dir, options)
+        return await run_agent_session_cli(prompt, project_dir, options, system_prompt=system_prompt, resume_session_id=resume_session_id)
 
     try:
         from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKClient
         from claude_code_sdk.types import HookMatcher
     except ImportError:
-        return await run_agent_session_cli(prompt, project_dir, options)
+        return await run_agent_session_cli(prompt, project_dir, options, system_prompt=system_prompt, resume_session_id=resume_session_id)
+
+    # TODO: SDK path does not yet support system_prompt or resume_session_id.
+    # Currently subscription-only (CLI path). If switching to API key, wire
+    # system_prompt into ClaudeCodeOptions or the SDK's system prompt mechanism.
+    # resume_session_id is silently ignored in SDK mode — falls back to fresh session.
 
     # Convert hooks dict to HookMatcher objects
     hooks_config = options.pop("hooks", {})
@@ -127,6 +341,9 @@ async def run_agent_session(
     cost_usd = 0.0
     usage = {}
     session_id = None
+    duration_ms = 0
+    duration_api_ms = 0
+    num_turns = 0
     _tool_count = 0
     _text_chars = 0
     _last_progress = 0
@@ -174,6 +391,9 @@ async def run_agent_session(
                     cost_usd = getattr(msg, "total_cost_usd", 0) or 0
                     usage = getattr(msg, "usage", {}) or {}
                     session_id = getattr(msg, "session_id", None)
+                    duration_ms = getattr(msg, "duration_ms", 0) or 0
+                    duration_api_ms = getattr(msg, "duration_api_ms", 0) or 0
+                    num_turns = getattr(msg, "num_turns", 0) or 0
                     # Check for error subtypes
                     subtype = getattr(msg, "subtype", "success")
                     if subtype and subtype != "success":
@@ -183,6 +403,9 @@ async def run_agent_session(
                             "cost": cost_usd,
                             "usage": usage,
                             "session_id": session_id,
+                            "duration_ms": duration_ms,
+                            "duration_api_ms": duration_api_ms,
+                            "num_turns": num_turns,
                             "error": f"Session ended with: {subtype}",
                         }
 
@@ -190,16 +413,17 @@ async def run_agent_session(
 
     except Exception as e:
         error_msg = str(e)
-        # Rate limiting — wait and retry
+        # Rate limiting — return rate_limited status (caller handles retry)
         if "rate_limit" in error_msg.lower() or "429" in error_msg:
-            print(f"  Rate limited. Waiting 60s...")
-            await asyncio.sleep(60)
             return {
-                "status": "error",
-                "output": output_text,
+                "status": "rate_limited",
+                "output": output_text or error_msg,
                 "cost": cost_usd,
                 "usage": {},
-                "session_id": None,
+                "session_id": session_id,
+                "duration_ms": 0,
+                "duration_api_ms": 0,
+                "num_turns": 0,
                 "error": f"Rate limited: {error_msg}",
             }
         raise
@@ -210,6 +434,9 @@ async def run_agent_session(
         "cost": cost_usd,
         "usage": usage,
         "session_id": session_id,
+        "duration_ms": duration_ms,
+        "duration_api_ms": duration_api_ms,
+        "num_turns": num_turns,
     }
 
 
@@ -217,35 +444,150 @@ async def run_agent_session_cli(
     prompt: str,
     project_dir: Path,
     options: Optional[dict] = None,
+    system_prompt: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
 ) -> dict:
-    """Run via `claude -p` CLI (subscription mode, no API key needed)."""
-    import subprocess
+    """Run via `claude -p` CLI (subscription mode, no API key needed).
 
+    Uses asyncio subprocess so multiple CLI sessions can run concurrently
+    in parallel fleet mode. The cmd array is built from trusted constants
+    and config values — no shell interpolation.
+
+    Uses --output-format json to get JSONL output with cost/token metrics.
+    The last line is a result message with total_cost_usd, usage, etc.
+
+    Args:
+        prompt: User message (dynamic, per-feature).
+        system_prompt: Static template for --system-prompt flag (enables caching).
+        resume_session_id: If set, resume a previous CLI session. The agent
+            keeps full conversation context from the prior run and receives
+            *prompt* as a new user message in the existing conversation.
+    """
     options = options or {}
     model = options.get("model", "claude-sonnet-4-6")
 
-    cmd = [
-        "claude", "-p", prompt,
-        "--output-format", "text",
-        "--model", model,
-        "--dangerously-skip-permissions",
-    ]
+    if resume_session_id:
+        # Resume existing session — agent retains full conversation history.
+        # system_prompt is already baked into the session, don't re-send.
+        cmd = [
+            "claude", "--resume", resume_session_id, "-p", prompt,
+            "--output-format", "json",
+            "--model", model,
+            "--dangerously-skip-permissions",
+        ]
+    else:
+        cmd = [
+            "claude", "-p", prompt,
+            "--output-format", "json",
+            "--model", model,
+            "--dangerously-skip-permissions",
+        ]
+        if system_prompt:
+            cmd += ["--system-prompt", system_prompt]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         cwd=str(project_dir),
-        timeout=3600,  # 1 hour max per session
     )
+    _active_worker_procs.add(proc)
 
-    stderr_note = f"\n[stderr: {result.stderr[:500]}]" if result.stderr else ""
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=3600,  # 1 hour max per session
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        _active_worker_procs.discard(proc)
+        return {
+            "status": "error",
+            "output": "[CLI session timed out after 3600s]",
+            "cost": 0.0,
+            "usage": {},
+            "session_id": None,
+            "duration_ms": 0,
+            "duration_api_ms": 0,
+            "num_turns": 0,
+        }
+    finally:
+        _active_worker_procs.discard(proc)
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    # Parse JSONL: extract text from assistant messages, metrics from result
+    output_parts = []
+    cost_usd = 0.0
+    usage = {}
+    session_id = None
+    duration_ms = 0
+    duration_api_ms = 0
+    num_turns = 0
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json_mod.loads(line)
+        except json_mod.JSONDecodeError:
+            output_parts.append(line)
+            continue
+
+        msg_type = msg.get("type", "")
+
+        if msg_type == "assistant":
+            for block in msg.get("content", []):
+                if block.get("type") == "text":
+                    output_parts.append(block.get("text", ""))
+
+        elif msg_type == "result":
+            # CLI uses "cost_usd", SDK uses "total_cost_usd" — check both
+            cost_usd = msg.get("cost_usd", 0) or msg.get("total_cost_usd", 0) or 0
+            usage = msg.get("usage", {}) or {}
+            session_id = msg.get("session_id")
+            duration_ms = msg.get("duration_ms", 0) or 0
+            duration_api_ms = msg.get("duration_api_ms", 0) or 0
+            num_turns = msg.get("num_turns", 0) or 0
+            if msg.get("result"):
+                output_parts.append(msg["result"])
+
+    output = "\n".join(output_parts)
+    if stderr:
+        output += f"\n[stderr: {stderr[:500]}]"
+
+    if proc.returncode != 0:
+        # Detect rate limit from Claude CLI output patterns:
+        # - "You've hit your limit" — subscription rate limit
+        # - "rate_limit" — API error code
+        # - "hit your limit · resets" — full message with reset time
+        _lower = output.lower()
+        _is_rate_limit = ("hit your limit" in _lower
+                          or "rate_limit" in _lower
+                          or ("resets " in _lower and "limit" in _lower))
+        return {
+            "status": "rate_limited" if _is_rate_limit else "error",
+            "output": output,
+            "cost": cost_usd,
+            "usage": usage,
+            "session_id": session_id,
+            "duration_ms": duration_ms,
+            "duration_api_ms": duration_api_ms,
+            "num_turns": num_turns,
+            "error_reason": "rate_limited" if _is_rate_limit else f"exit code {proc.returncode}",
+        }
+
     return {
-        "status": "continue" if result.returncode == 0 else "error",
-        "output": result.stdout + stderr_note,
-        "cost": 0.0,  # CLI doesn't report cost
-        "usage": {},
-        "session_id": None,
+        "status": "continue",
+        "output": output,
+        "cost": cost_usd,
+        "usage": usage,
+        "session_id": session_id,
+        "duration_ms": duration_ms,
+        "duration_api_ms": duration_api_ms,
+        "num_turns": num_turns,
     }
 
 
@@ -263,7 +605,10 @@ async def run_parallel_wave(
     work_plan_path: Path,
     session: dict,
 ) -> dict:
-    """Run a single parallel wave: N generators in worktrees, merge, evaluate.
+    """Run parallel worker pool: gen→QA pipelines with N concurrent slots.
+
+    Pool size is runtime-configurable via <state_dir>/pool_size file.
+    Write a number to resize live: echo 5 > .harness/runs/<run>/pool_size
 
     Returns {completed: list[str], failed: list[str], conflicts: list[str]}.
     """
@@ -278,196 +623,927 @@ async def run_parallel_wave(
 
     completed, failed, conflicts = [], [], []
 
-    # Handle sequential features (no scope) one at a time
     for feat in sequential_features:
-        failed.append(feat["id"])  # Mark as needing sequential processing
+        failed.append(feat["id"])
 
     if not parallel_features:
         return {"completed": completed, "failed": failed, "conflicts": conflicts}
 
-    # Sweep stale instances before starting
+    # Clean up failed/interrupted assignments with no live worktree — prevents dispatch blockage
+    _wa_data = worker_assignments.load_assignments(state_dir)
+    _stale_wids = []
+    for _wid, _asgn in _wa_data.get("assignments", {}).items():
+        if _asgn.get("status") in ("failed", "interrupted", "running"):
+            _wt = Path(_asgn.get("worktree_dir", ""))
+            _br = _asgn.get("branch", "")
+            if not _wt.exists() and not branch_has_commits(project_dir, _br):
+                _stale_wids.append(_wid)
+    for _wid in _stale_wids:
+        worker_assignments.remove_assignment(state_dir, _wid)
+    if _stale_wids:
+        print(f"  Cleared {len(_stale_wids)} stale assignment(s): {_stale_wids}")
+
+    # Sweep stale instances
     swept = sweep_stale_instances(state_dir, parallel_config.get("stale_instance_hours", 2.0))
     if swept:
         swept_ids = get_swept_feature_ids(swept)
         for fid in swept_ids:
             fleet_session.requeue_feature(session, fid, reason="stale_instance")
+        for inst in swept:
+            wt = inst.get("worktreeDir")
+            br = inst.get("branch")
+            if wt and br:
+                try:
+                    cleanup_worktree(project_dir, Path(wt), br)
+                except Exception:
+                    pass
         print(f"  Swept {len(swept)} stale instance(s), requeued {len(swept_ids)} feature(s)")
 
-    # Batch features into groups of max_workers
-    batches = [parallel_features[i:i + max_workers] for i in range(0, len(parallel_features), max_workers)]
+    # --- Runtime-configurable pool size ---
+    def _get_pool_size() -> int:
+        pool_file = state_dir / "pool_size"
+        if pool_file.exists():
+            try:
+                val = int(pool_file.read_text().strip())
+                if val > 0:
+                    return val
+            except (ValueError, OSError):
+                pass
+        return max_workers
 
-    for batch_idx, batch in enumerate(batches):
-        agent_ids = []
-        worktrees = []  # (agent_id, feature, worktree_dir, branch_name)
+    # Relay context is now built per-agent (not once per wave) so agents
+    # starting later see briefs from agents that already finished.
+    # relay_enabled flag still controls whether relay is used at all.
 
-        # Claim scope and create worktrees
-        for feature in batch:
+    test_command = config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'")
+
+    wave_replacements = {
+        "STATE_DIR": str(state_dir),
+        "TEST_COMMAND": test_command,
+        "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
+    }
+    prompt_file = "generator-v2.md" if (prompts_dir / "generator-v2.md").exists() else resolve_prompt("generator", config)
+    gen_system_prompt = load_prompt(prompts_dir / prompt_file, wave_replacements)
+
+    _qa_repl = {
+        "STATE_DIR": str(state_dir),
+        "TEST_COMMAND": test_command,
+        "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
+        "RETRY_COUNT": "1",
+        "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
+    }
+    _qa_file = "evaluator-v2.md" if (prompts_dir / "evaluator-v2.md").exists() else "evaluator.md"
+    qa_system_prompt = load_prompt(prompts_dir / _qa_file, _qa_repl)
+
+    gen_timeout = timeout_minutes * 60
+    qa_timeout = 15 * 60
+
+    # Worker pool with async queue for results
+    # Dynamic pool: re-reads pool_size file on every acquire so live resizing works
+    _pool_active = 0
+    _pool_lock = asyncio.Lock()
+    _pool_slot_free = asyncio.Event()
+    _pool_slot_free.set()
+
+    async def _acquire_slot():
+        nonlocal _pool_active
+        while True:
+            async with _pool_lock:
+                if _pool_active < _get_pool_size():
+                    _pool_active += 1
+                    return
+            _pool_slot_free.clear()
+            await _pool_slot_free.wait()
+
+    async def _release_slot():
+        nonlocal _pool_active
+        async with _pool_lock:
+            _pool_active -= 1
+        _pool_slot_free.set()
+
+    pool_size = _get_pool_size()
+    result_queue = asyncio.Queue()
+    max_retries = config.get("generator", {}).get("max_retries_per_feature", 3)
+    # Retry counts: always read from work_plan (persisted on disk), never in-memory
+    print(f"  Pool: {len(parallel_features)} features, {pool_size} concurrent slots")
+
+    def _get_attempt_count(feature_id: str) -> int:
+        """Read attempt count from persisted work_plan — single source of truth."""
+        if work_plan is not None:
+            for _, _, _, _t in work_plan._all_tasks():
+                if _t["id"] == feature_id:
+                    return _t.get("attempts", 0)
+        return 0
+
+    def _find_reusable_worktree(feature_id: str):
+        """Look up reusable worktree from worker_assignments on disk — no in-memory cache.
+
+        Returns (worktree_path, branch, worker_id, gen_session_id) or None.
+        gen_session_id may be None if the prior run didn't record one.
+        """
+        _wa_path = state_dir / "fleet" / "worker_assignments.json"
+        if not _wa_path.exists():
+            return None
+        try:
+            _wa = json_mod.loads(_wa_path.read_text())
+            for _wid, _asgn in _wa.get("assignments", {}).items():
+                if _asgn.get("feature_id") == feature_id and _asgn.get("status") == "failed":
+                    _wt_path = Path(_asgn.get("worktree_dir", ""))
+                    _br = _asgn.get("branch", "")
+                    _sid = _asgn.get("gen_session_id") or None  # treat "" as None
+                    if _wt_path.exists() and _br and branch_has_commits(project_dir, _br):
+                        return (_wt_path, _br, _wid, _sid)
+        except Exception:
+            pass
+        return None
+
+    tracker.wave_start(wave_num, len(parallel_features), [f["id"] for f in parallel_features])
+    fleet_session.start_wave(session, wave_num, [])
+    fleet_session.save_session(session, state_dir)
+
+    async def _pool_worker(feature):
+        """Acquire pool slot -> create worktree -> gen -> QA -> push result."""
+        feature_id = feature["id"]
+
+        await _acquire_slot()
+        try:
+            if _shutdown_requested or _check_drain(state_dir):
+                await result_queue.put(("skipped", feature_id, None))
+                return
+
             agent_id = generate_instance_id()
             scope = feature.get("scope", [])
-            feature_id = feature["id"]
 
-            try:
-                claim_scope(agent_id, scope, feature_id, state_dir)
-                register_instance(agent_id, feature_id, 0, wave_num, state_dir)
-            except ScopeOverlapError as e:
-                print(f"  Scope overlap for {feature_id}: {e} — requeued")
-                fleet_session.requeue_feature(session, feature_id, reason="scope_overlap")
-                conflicts.append(feature_id)
-                continue
+            # Reuse existing worktree from prior eval-fail retry (read from disk)
+            _existing = _find_reusable_worktree(feature_id)
+            _resume_sid = None  # generator session ID for --resume
+            if _existing:
+                wt_dir, branch, wid, _resume_sid = _existing
+                if _resume_sid:
+                    print(f"  {feature_id}: reusing worktree {wid} for retry (resuming session)")
+                else:
+                    print(f"  {feature_id}: reusing worktree {wid} for retry (fresh session)")
+                register_instance(agent_id, feature_id, 0, wave_num, state_dir,
+                                  worktree_dir=str(wt_dir), branch=branch)
+            else:
+                # Create new worktree
+                try:
+                    claim_scope(agent_id, scope, feature_id, state_dir)
+                except ScopeOverlapError as e:
+                    print(f"  Scope overlap for {feature_id}: {e} -- requeued")
+                    await result_queue.put(("conflict", feature_id, None))
+                    return
 
-            try:
-                wt_dir, branch = create_worktree(project_dir, hash(agent_id) % 10000)
-                worktrees.append((agent_id, feature, wt_dir, branch))
-                agent_ids.append(agent_id)
-            except Exception as e:
-                print(f"  Worktree creation failed for {feature_id}: {e}")
-                unregister_instance(agent_id, state_dir)
-                failed.append(feature_id)
+                try:
+                    wid_num = hash(agent_id) % 10000
+                    wt_dir, branch = create_worktree(project_dir, wid_num)
+                    register_instance(agent_id, feature_id, 0, wave_num, state_dir,
+                                      worktree_dir=str(wt_dir), branch=branch)
+                    worker_assignments.add_assignment(
+                        state_dir, f"worker-{wid_num}", feature_id,
+                        branch, str(wt_dir), agent_id, wave_num, scope,
+                    )
+                    wid = f"worker-{wid_num}"
+                except Exception as e:
+                    print(f"  Worktree creation failed for {feature_id}: {e}")
+                    unregister_instance(agent_id, state_dir)
+                    await result_queue.put(("error", feature_id, None))
+                    return
 
-        if not worktrees:
-            continue
+            # --- Generator (own timeout) ---
+            feature_desc = feature.get("description", "")
+            # Build relay fresh per-agent so later agents see earlier agents' briefs
+            _relay = get_relay_context(state_dir, wave_num, include_current_wave=True) if relay_enabled else ""
+            write_task_brief(wt_dir, feature, state_dir,
+                             work_plan=work_plan, relay_context=_relay)
+            # feedback.md is already in worktree from evaluator (retry case)
+            # or needs to be copied from persistent location (first attempt after resume)
+            _wt_fb = Path(wt_dir) / "feedback.md"
+            if not _wt_fb.exists():
+                _fb_file = state_dir / f"feedback-{feature_id}.md"
+                if _fb_file.exists():
+                    import shutil
+                    shutil.copy2(_fb_file, _wt_fb)
 
-        # Emit wave start
-        feature_ids = [f["id"] for _, f, _, _ in worktrees]
-        tracker.wave_start(wave_num, len(worktrees), feature_ids)
-        fleet_session.start_wave(session, wave_num, agent_ids)
-
-        # Build prompts with discovery relay
-        relay_context = ""
-        if relay_enabled:
-            relay_context = get_relay_context(state_dir, wave_num)
-
-        test_command = config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'")
-
-        # Launch generators in parallel
-        async def _run_one(agent_id, feature, wt_dir):
-            gen_replacements = {
-                "STATE_DIR": str(state_dir),
-                "TEST_COMMAND": test_command,
-                "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
-            }
-            gen_prompt = load_prompt(prompts_dir / resolve_prompt("generator", config), gen_replacements)
-            if relay_context:
-                gen_prompt = relay_context + "\n\n" + gen_prompt
             gen_options = create_client_options(wt_dir, config)
-            return await run_agent_session(gen_prompt, gen_options, wt_dir)
 
-        tasks = []
-        for agent_id, feature, wt_dir, branch in worktrees:
-            coro = _run_one(agent_id, feature, wt_dir)
-            wrapped = asyncio.wait_for(coro, timeout=timeout_minutes * 60)
-            tasks.append((agent_id, feature, wt_dir, branch, asyncio.ensure_future(wrapped)))
+            # If we have a prior generator session ID, resume it with eval feedback
+            # instead of starting fresh — agent keeps full context from prior run.
+            if _resume_sid:
+                user_msg = (
+                    f"The evaluator reviewed your work on {feature_id} and found issues. "
+                    f"Read feedback.md in this directory for the full eval report. "
+                    f"Fix ALL issues listed there. You already have full context from your previous work. "
+                    f"Do NOT re-explore the codebase — go straight to fixing the problems."
+                )
+                try:
+                    gen_result = await asyncio.wait_for(
+                        run_agent_session(user_msg, gen_options, wt_dir,
+                                          resume_session_id=_resume_sid),
+                        timeout=gen_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"  Generator {agent_id} on {feature_id}: timed out after {timeout_minutes}m")
+                    # Preserve session_id for next retry — prefer any new ID from partial output
+                    _timeout_sid = _resume_sid
+                    if _timeout_sid:
+                        worker_assignments.update_assignment_session_id(state_dir, wid, _timeout_sid)
+                    await result_queue.put(("result", feature_id, {
+                        "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
+                        "branch": branch, "wid": wid,
+                        "gen_result": {"output": "", "cost": 0, "session_id": _timeout_sid},
+                        "gen_status": "timeout", "qa_result": None,
+                    }))
+                    return
+            else:
+                user_msg = f"Your assigned feature: {feature_id} -- {feature_desc}\nRead TASK_BRIEF.md in this directory for full details."
+                try:
+                    gen_result = await asyncio.wait_for(
+                        run_agent_session(user_msg, gen_options, wt_dir, system_prompt=gen_system_prompt),
+                        timeout=gen_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"  Generator {agent_id} on {feature_id}: timed out after {timeout_minutes}m")
+                    await result_queue.put(("result", feature_id, {
+                        "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
+                        "branch": branch, "wid": wid,
+                        "gen_result": {"output": "", "cost": 0}, "gen_status": "timeout", "qa_result": None,
+                    }))
+                    return
 
-        # Gather results
-        results = []
-        for agent_id, feature, wt_dir, branch, task in tasks:
-            feature_id = feature["id"]
+            # Persist generator session ID for resume on retry
+            _gen_sid = gen_result.get("session_id")
+            if _gen_sid:
+                worker_assignments.update_assignment_session_id(state_dir, wid, _gen_sid)
+            elif _resume_sid:
+                # Resume was attempted but no session_id came back (session expired/missing).
+                # Clear the stale ID so next retry falls back to a fresh session.
+                worker_assignments.update_assignment_session_id(state_dir, wid, "")
+
+            output = gen_result.get("output", "")
+            gen_status = "ok"
+            if gen_result.get("status") == "error":
+                if _resume_sid:
+                    print(f"  Agent {agent_id} on {feature_id}: resume failed ({gen_result.get('error_reason', 'session error')}) -- next retry will use fresh session")
+                else:
+                    print(f"  Agent {agent_id} on {feature_id}: {gen_result.get('error_reason', 'session error')}")
+                gen_status = "error"
+            elif "---HARNESS_STATUS---" not in output:
+                print(f"  Agent {agent_id} on {feature_id}: no HARNESS_STATUS block -- treating as failed")
+                gen_status = "error"
+
+            should_qa = gen_status == "ok" or branch_has_commits(project_dir, branch)
+            if not should_qa:
+                await result_queue.put(("result", feature_id, {
+                    "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
+                    "branch": branch, "wid": wid,
+                    "gen_result": gen_result, "gen_status": gen_status, "qa_result": None,
+                }))
+                return
+
+            if gen_status != "ok":
+                print(f"  Agent {agent_id} on {feature_id}: {gen_status} but has commits -- running QA anyway")
+
+            # --- QA (own timeout) ---
+            worker_assignments.update_assignment_phase(state_dir, wid, "evaluator")
+            print(f"  QA {feature_id} in worktree")
+            qa_user_msg = _build_qa_user_msg(feature_id, work_plan)
+            qa_options = create_client_options(wt_dir, config)
             try:
-                result = await task
-                results.append((agent_id, feature, wt_dir, branch, result, "ok"))
+                qa_result = await asyncio.wait_for(
+                    run_agent_session(qa_user_msg, qa_options, wt_dir, system_prompt=qa_system_prompt),
+                    timeout=qa_timeout,
+                )
             except asyncio.TimeoutError:
-                print(f"  Agent {agent_id} timed out on {feature_id}")
-                tracker.agent_timeout(agent_id, feature_id, timeout_minutes * 60)
-                results.append((agent_id, feature, wt_dir, branch, {"output": "", "cost": 0}, "timeout"))
-            except Exception as e:
-                print(f"  Agent {agent_id} failed on {feature_id}: {e}")
-                results.append((agent_id, feature, wt_dir, branch, {"output": "", "cost": 0}, "error"))
+                print(f"  QA {feature_id}: timed out after 15m")
+                qa_result = {"output": "[QA timed out]", "cost": 0}
 
-        # Check for all-failed escalation
-        statuses = [s for _, _, _, _, _, s in results]
-        if all(s != "ok" for s in statuses):
-            tracker.wave_all_failed(wave_num, [f"{f['id']}:{s}" for _, f, _, _, _, s in results])
-            print(f"  WAVE {wave_num}: ALL agents failed — falling back to sequential")
-            for agent_id, feature, wt_dir, branch, _, _ in results:
-                cleanup_worktree(project_dir, wt_dir, branch)
-                unregister_instance(agent_id, state_dir)
-                failed.append(feature["id"])
-            fleet_session.complete_wave(session, wave_num)
+            # Persist evaluator session ID for crash recovery
+            _eval_sid = qa_result.get("session_id")
+            if _eval_sid:
+                worker_assignments.update_assignment_session_id(state_dir, wid, _eval_sid, phase="evaluator")
+
+            await result_queue.put(("result", feature_id, {
+                "agent_id": agent_id, "feature": feature, "wt_dir": wt_dir,
+                "branch": branch, "wid": wid,
+                "gen_result": gen_result, "gen_status": gen_status, "qa_result": qa_result,
+            }))
+        finally:
+            await _release_slot()
+
+    # Launch all features into pool (dynamic pool throttles concurrency)
+    async def _safe_worker(feature):
+        """Wrapper ensuring result_queue always gets a message, even on crash."""
+        try:
+            await _pool_worker(feature)
+        except Exception as e:
+            print(f"  Worker crashed on {feature['id']}: {e}")
+            await result_queue.put(("error", feature["id"], None))
+
+    for feature in parallel_features:
+        asyncio.ensure_future(_safe_worker(feature))
+
+    # Process results as they arrive -- merges are sequential (touch main)
+    processed = 0
+    total = len(parallel_features)
+
+    while processed < total:
+        kind, feature_id, data = await result_queue.get()
+        processed += 1
+
+        if kind == "skipped":
+            continue
+        elif kind == "conflict":
+            # Re-dispatch after delay — conflicting scope will free when other task finishes
+            _conflict_feature = next((f for f in parallel_features if f["id"] == feature_id), None)
+            if _conflict_feature:
+                async def _delayed_retry(feat, delay=15):
+                    await asyncio.sleep(delay)
+                    await _safe_worker(feat)
+                total += 1
+                asyncio.ensure_future(_delayed_retry(_conflict_feature))
+                print(f"  {feature_id}: scope conflict -- retry in 15s")
+            else:
+                conflicts.append(feature_id)
+            continue
+        elif kind == "error":
+            # Worker crashed before producing a result — retry
+            _error_feature = next((f for f in parallel_features if f["id"] == feature_id), None)
+            if work_plan is not None:
+                work_plan.increment_task_attempts(feature_id, work_plan_path)
+            attempt = _get_attempt_count(feature_id)
+            if _error_feature and attempt < max_retries:
+                print(f"  {feature_id}: worker error ({attempt}/{max_retries}) -- retrying")
+                total += 1
+                asyncio.ensure_future(_safe_worker(_error_feature))
+            else:
+                failed.append(feature_id)
             continue
 
-        # Merge results — sorted by feature ID for deterministic order
-        results.sort(key=lambda r: r[1]["id"])
+        # kind == "result"
+        r = data
+        agent_id = r["agent_id"]
+        feature = r["feature"]
+        wt_dir = r["wt_dir"]
+        branch = r["branch"]
+        wid = r["wid"]
+        gen_result = r["gen_result"]
+        gen_status = r["gen_status"]
+        qa_result = r["qa_result"]
 
-        for agent_id, feature, wt_dir, branch, result, status in results:
-            feature_id = feature["id"]
-            cost_tracker.record("generator", result.get("cost", 0))
-            cost_tracker.record_feature(feature_id, "generator", result.get("cost", 0))
+        cost_tracker.record("generator", gen_result.get("cost", 0), **_metrics_from(gen_result))
+        cost_tracker.record_feature(feature_id, "generator", gen_result.get("cost", 0))
 
-            # Compress discovery brief
-            handoff_data = parse_handoff(result.get("output", ""))
-            brief = compress_discovery(result.get("output", ""), agent_id, feature_id, status)
-            write_brief(brief, wave_num, agent_id, state_dir)
+        # Compress discovery brief + write to shared knowledge dir
+        handoff_data = parse_handoff(gen_result.get("output", ""))
+        brief = compress_discovery(gen_result.get("output", ""), agent_id, feature_id, gen_status)
+        write_brief(brief, wave_num, agent_id, state_dir)
+        # Also write to knowledge dir so other agents can read it directly
+        _knowledge_dir = state_dir / "knowledge"
+        _knowledge_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (_knowledge_dir / f"{feature_id}.md").write_text(brief)
+        except Exception as e:
+            _log_error(state_dir, f"knowledge_write:{feature_id}", e)
 
-            if status != "ok":
-                fleet_session.requeue_feature(session, feature_id, reason=status)
+        # No QA result -> generator failed without commits
+        if qa_result is None:
+            # Reset passes=True the generator may have written prematurely
+            _reset_feature_passes(state_dir, feature_id)
+
+            # Only force-delete if no commits — preserve worktrees with prior work
+            if branch_has_commits(project_dir, branch):
+                worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                print(f"  {feature_id}: gen failed but worktree has commits — preserving")
+            else:
+                cleanup_worktree(project_dir, wt_dir, branch, force=True)
+                worker_assignments.remove_assignment(state_dir, wid)
+            unregister_instance(agent_id, state_dir)
+            fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, gen_status)
+
+            if work_plan is not None:
+                work_plan.increment_task_attempts(feature_id, work_plan_path)
+            attempt = _get_attempt_count(feature_id)
+            if attempt < max_retries:
+                print(f"  {feature_id}: gen {gen_status} ({attempt}/{max_retries}) -- retrying")
+                fleet_session.requeue_feature(session, feature_id, reason=gen_status)
+                total += 1
+                asyncio.ensure_future(_safe_worker(feature))
+            else:
+                print(f"  {feature_id}: gen {gen_status} ({attempt}/{max_retries}) -- BLOCKED")
                 failed.append(feature_id)
-                cleanup_worktree(project_dir, wt_dir, branch)
-                unregister_instance(agent_id, state_dir)
-                fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, status)
-                continue
+                if work_plan is not None:
+                    work_plan.mark_task_blocked(feature_id, "max_retries_exceeded", work_plan_path)
+            fleet_session.save_session(session, state_dir)
+            continue
 
-            # Merge worktree
-            merge_result = merge_worktree(project_dir, branch)
-            cleanup_worktree(project_dir, wt_dir, branch)
+        # Record QA cost
+        cost_tracker.record("evaluator", qa_result.get("cost", 0), **_metrics_from(qa_result))
+        cost_tracker.record_feature(feature_id, "evaluator", qa_result.get("cost", 0))
+
+        if "VERDICT: FAIL" in qa_result.get("output", ""):
+            # Reset passes=True the generator may have written prematurely
+            _reset_feature_passes(state_dir, feature_id)
+            # Evaluator writes ./feedback.md in worktree — also persist for crash recovery.
+            _fb_path = state_dir / f"feedback-{feature_id}.md"
+            _wt_fb = Path(wt_dir) / "feedback.md"
+            if _wt_fb.exists():
+                import shutil
+                shutil.copy2(_wt_fb, _fb_path)
+            else:
+                _fb_path.write_text(qa_result.get("output", ""))
+                # Write to worktree too so retry generator sees it
+                _wt_fb.write_text(qa_result.get("output", ""))
+
             unregister_instance(agent_id, state_dir)
 
-            if not merge_result["success"]:
-                if merge_result.get("conflict"):
-                    tracker.merge_conflict(agent_id, feature_id, merge_result.get("error", ""))
-                    fleet_session.requeue_feature(session, feature_id, reason="conflict")
-                    conflicts.append(feature_id)
-                    fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "conflict")
-                else:
-                    failed.append(feature_id)
-                    fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "merge_error")
+            if work_plan is not None:
+                work_plan.increment_task_attempts(feature_id, work_plan_path)
+            attempt = _get_attempt_count(feature_id)
+
+            fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "eval_fail")
+            tracker.feature_fail(feature_id, feature.get("description", ""), "VERDICT: FAIL")
+
+            if attempt < max_retries:
+                # Keep worktree — mark assignment as failed so _find_reusable_worktree picks it up
+                worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                print(f"  {feature_id}: QA FAIL ({attempt}/{max_retries}) -- retrying in same worktree")
+                fleet_session.requeue_feature(session, feature_id, reason="eval_fail")
+                total += 1
+                asyncio.ensure_future(_safe_worker(feature))
+            else:
+                print(f"  {feature_id}: QA FAIL ({attempt}/{max_retries}) -- BLOCKED (worktree preserved)")
+                # Never destroy worktree with commits — it can be recovered manually or on next resume
+                worker_assignments.update_assignment_status(state_dir, wid, "blocked")
+                failed.append(feature_id)
+                if work_plan is not None:
+                    work_plan.mark_task_blocked(feature_id, "max_retries_exceeded", work_plan_path)
+            fleet_session.save_session(session, state_dir)
+            continue
+
+        # QA passed -- safe to merge
+        merge_result = merge_worktree(project_dir, branch)
+        unregister_instance(agent_id, state_dir)
+
+        if not merge_result["success"]:
+            # NEVER cleanup worktree on merge failure — preserve the code for retry
+            if merge_result.get("conflict"):
+                tracker.merge_conflict(agent_id, feature_id, merge_result.get("error", ""))
+                fleet_session.requeue_feature(session, feature_id, reason="conflict")
+                conflicts.append(feature_id)
+                fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "conflict")
+            else:
+                failed.append(feature_id)
+                fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "merge_error")
+            worker_assignments.update_assignment_status(state_dir, wid, "failed")
+            fleet_session.save_session(session, state_dir)
+            continue
+
+        # Merge succeeded — NOW safe to cleanup worktree
+        cleanup_worktree(project_dir, wt_dir, branch, force=True)
+        worker_assignments.remove_assignment(state_dir, wid)
+        await state_mgr.mark_feature_passing_async(feature_id)
+        if work_plan is not None:
+            work_plan.mark_task_done(feature_id, work_plan_path)
+            work_plan.sync_feature_list(state_dir / "feature_list.json")
+        fleet_session.mark_feature_complete(session, feature_id)
+        completed.append(feature_id)
+        tracker.feature_pass(feature_id, feature.get("description", ""), 0)
+        fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "complete")
+        fleet_session.save_session(session, state_dir)
+        print(f"  {feature_id}: QA PASS -- merged to main")
+
+        # Keep state.json in sync
+        _cur = state_mgr.load_state()
+        await state_mgr.update_state_async(
+            phase="generator",
+            current_feature_id=feature_id,
+            iteration=_cur.get("iteration", 0) + 1,
+            generator_sessions=_cur.get("generator_sessions", 0) + 1,
+            total_cost_usd=cost_tracker.total,
+            cost_breakdown=cost_tracker.to_dict(),
+            last_updated=datetime.now(timezone.utc).isoformat(),
+        )
+
+        # Add discoveries
+        if handoff_data.get("found") and handoff_data.get("items"):
+            for item in handoff_data["items"][:3]:
+                fleet_session.add_discovery(session, wave_num, f"Wave {wave_num} {feature_id}: {item}")
+
+    # Complete wave
+    fleet_session.complete_wave(session, wave_num)
+    fleet_session.save_session(session, state_dir)
+    tracker.wave_complete(wave_num, len(completed), len(failed), len(conflicts))
+
+    return {"completed": completed, "failed": failed, "conflicts": conflicts}
+
+
+def _setup_run(
+    project_dir: Path,
+    resume: bool = False,
+    run_id: Optional[str] = None,
+    prompt: str = "",
+) -> tuple:
+    """Set up run isolation. Returns (run_id, state_mgr, registry).
+
+    - New run: creates .harness/runs/<run_id>/ and index entry
+    - Resume without run_id: finds latest in_progress run
+    - Resume with run_id: targets that specific run
+    - Auto-migrates legacy .harness/state/ layout
+    """
+    harness_dir = project_dir / ".harness"
+    harness_dir.mkdir(parents=True, exist_ok=True)
+
+    registry = RunRegistry(harness_dir)
+
+    # Auto-migrate legacy state/ directory if present
+    registry.migrate_legacy()
+
+    if resume and run_id:
+        # Explicit run target
+        state_mgr = StateManager(registry.run_dir(run_id))
+        return run_id, state_mgr, registry
+
+    if resume:
+        # Find latest incomplete run
+        found = registry.find_resumable()
+        if found:
+            state_mgr = StateManager(registry.run_dir(found))
+            return found, state_mgr, registry
+        # Nothing to resume — fall through to create new
+
+    # Create new run
+    new_id = registry.create_run(prompt=prompt or "")
+    state_mgr = StateManager(registry.run_dir(new_id))
+    return new_id, state_mgr, registry
+
+
+async def resume_interrupted_workers(
+    project_dir: Path,
+    state_dir: Path,
+    config: dict,
+    prompts_dir: Path,
+    cost_tracker: "CostTracker",
+    tracker: "EventTracker",
+    state_mgr: "StateManager",
+    work_plan: "WorkPlan",
+    work_plan_path: Path,
+) -> dict:
+    """Resume agents into existing worktrees that have unmerged commits.
+
+    Reads worker_assignments.json, finds worktrees with commits ahead of main,
+    and re-dispatches agents with a recovery prompt.
+
+    Returns {completed: list[str], failed: list[str], resumed: int}.
+    """
+    import subprocess as _sp
+
+    # Kill orphaned claude processes from previous orchestrator in our worktrees.
+    # When the orchestrator is kill -9'd, child claude processes survive as orphans.
+    _worktree_base = str(project_dir / ".worktrees")
+    try:
+        _ps = _sp.run(
+            ["pgrep", "-f", f"claude.*{_worktree_base}"],
+            capture_output=True, text=True,
+        )
+        for _pid_str in _ps.stdout.strip().splitlines():
+            _pid = int(_pid_str.strip())
+            try:
+                import os
+                os.kill(_pid, 9)
+                print(f"  Killed orphaned agent PID {_pid}")
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass  # pgrep not available or no matches — safe to continue
+
+    # Clean stale coordination state left by dead agents before checking assignments
+    from .coordination import sweep_stale_instances as _sweep_stale
+    _swept = _sweep_stale(state_dir, stale_hours=0.01)  # ~36 seconds — aggressive on resume
+    if _swept:
+        print(f"  Resume: swept {len(_swept)} stale coordination entries")
+
+    resumable = worker_assignments.get_resumable_assignments(state_dir)
+    if not resumable:
+        return {"completed": [], "failed": [], "resumed": 0}
+
+    completed, failed = [], []
+    dispatched = []
+    _pending_evals = []  # (wid, assignment, wt_dir, branch, feature_id)
+    _needs_dispatch = set()  # wids that need recovery generator
+
+    for wid, assignment in resumable.items():
+        wt_dir = Path(assignment["worktree_dir"])
+        branch = assignment["branch"]
+        feature_id = assignment["feature_id"]
+
+        # Decision matrix: check worktree and branch state
+        wt_exists = wt_dir.exists()
+        br_has_commits = branch_has_commits(project_dir, branch)
+
+        if not wt_exists and not br_has_commits:
+            # Nothing to recover — clear assignment, task goes back to pending pool
+            print(f"  Resume skip {feature_id}: no worktree or branch — returning to pool")
+            worker_assignments.remove_assignment(state_dir, wid)
+            continue
+
+        if wt_exists and not br_has_commits:
+            # Worktree exists but no commits — nothing to preserve, clean up
+            print(f"  Resume skip {feature_id}: no commits — cleaning up")
+            cleanup_worktree(project_dir, wt_dir, branch, force=True)
+            worker_assignments.remove_assignment(state_dir, wid)
+            continue
+
+        if not wt_exists and br_has_commits:
+            # Branch exists with commits but worktree gone — recreate worktree from branch
+            print(f"  Resume {feature_id}: recreating worktree from branch {branch}")
+            try:
+                _sp.run(
+                    ["git", "worktree", "add", str(wt_dir), branch],
+                    cwd=project_dir, capture_output=True, text=True, check=True,
+                )
+                _init_submodules_local(project_dir, wt_dir)
+            except Exception as e:
+                print(f"  Resume failed for {feature_id}: {e}")
+                worker_assignments.remove_assignment(state_dir, wid)
+                failed.append(feature_id)
                 continue
 
-            # Merged successfully — run evaluator sequentially
-            print(f"  Merged {feature_id} — running evaluator")
-            eval_replacements = {
-                "STATE_DIR": str(state_dir),
-                "TEST_COMMAND": test_command,
-                "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
-                "FEATURE_ID": feature_id,
-                "RETRY_COUNT": "1",
-                "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
-            }
-            eval_prompt = load_prompt(prompts_dir / "evaluator.md", eval_replacements)
-            eval_options = create_client_options(
-                project_dir, config,
-                system_prompt="You are a skeptical QA evaluator. Find problems. Do not approve mediocre work.",
+        # Ensure submodules are populated (older worktrees may have empty dirs)
+        _init_submodules_local(project_dir, wt_dir)
+
+        # Check if evaluator already passed (pending-merge: commit exists, eval passed,
+        # but merge never happened because orchestrator was killed mid-pipeline).
+        # Detect by checking for VERDICT: PASS in feedback or evaluator phase completion.
+        _phase = assignment.get("phase", "generator")
+        _gen_sid = assignment.get("gen_session_id") or None
+        _eval_sid = assignment.get("eval_session_id") or None
+
+        if _phase == "evaluator" and br_has_commits:
+            # Evaluator was running or finished — re-evaluate to determine pass/fail
+            _pending_evals.append((wid, assignment, wt_dir, branch, feature_id))
+            continue
+
+        # Failed workers with commits: collect for parallel evaluation below.
+        if assignment.get("status") == "failed" and br_has_commits:
+            _pending_evals.append((wid, assignment, wt_dir, branch, feature_id))
+            continue
+
+        # Status is "running" or "interrupted" in generator phase — needs recovery generator
+        _needs_dispatch.add(wid)
+
+    # --- Parallel evaluation of failed worktrees ---
+    if _pending_evals:
+        print(f"  Evaluating {len(_pending_evals)} failed worktree(s) in parallel...")
+        test_command = config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'")
+        timeout_mins = config.get("parallel", {}).get("agent_timeout_minutes", 30)
+
+        async def _eval_one(wid, assignment, wt_dir, branch, feature_id):
+            eval_repl, eval_file, eval_fallback, eval_user_msg = _build_eval_replacements(
+                feature_id, state_dir, config, test_command, work_plan=work_plan)
+            _eval_path = prompts_dir / eval_file if (prompts_dir / eval_file).exists() else prompts_dir / eval_fallback
+            eval_system = load_prompt(_eval_path, eval_repl)
+            eval_options = create_client_options(wt_dir, config)
+            try:
+                result = await asyncio.wait_for(
+                    run_agent_session(eval_user_msg, eval_options, wt_dir, system_prompt=eval_system),
+                    timeout=15 * 60,
+                )
+            except asyncio.TimeoutError:
+                result = {"output": "[eval timed out]", "cost": 0}
+            return wid, assignment, wt_dir, branch, feature_id, result
+
+        eval_tasks = [
+            _eval_one(wid, a, wt, br, fid)
+            for wid, a, wt, br, fid in _pending_evals
+        ]
+        eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+
+        for item in eval_results:
+            if isinstance(item, Exception):
+                print(f"  Recovery eval crashed: {item}")
+                continue
+            wid, assignment, wt_dir, branch, feature_id, eval_result = item
+            cost_tracker.record("evaluator", eval_result.get("cost", 0), **_metrics_from(eval_result))
+
+            if "VERDICT: FAIL" not in eval_result.get("output", ""):
+                # Passed — merge sequentially (touches main)
+                merge_result = merge_worktree(project_dir, branch)
+                if merge_result["success"]:
+                    cleanup_worktree(project_dir, wt_dir, branch, force=True)
+                    worker_assignments.remove_assignment(state_dir, wid)
+                    await state_mgr.mark_feature_passing_async(feature_id)
+                    if work_plan is not None:
+                        work_plan.mark_task_done(feature_id, work_plan_path)
+                        work_plan.sync_feature_list(state_dir / "feature_list.json")
+                    completed.append(feature_id)
+                    print(f"  Resume {feature_id}: evaluated + merged → PASSED")
+                    _cur = state_mgr.load_state()
+                    await state_mgr.update_state_async(
+                        phase="generator",
+                        current_feature_id=feature_id,
+                        iteration=_cur.get("iteration", 0) + 1,
+                        generator_sessions=_cur.get("generator_sessions", 0) + 1,
+                        total_cost_usd=cost_tracker.total,
+                        cost_breakdown=cost_tracker.to_dict(),
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    print(f"  Resume {feature_id}: merge failed — {merge_result.get('error', '')[:100]}")
+                    failed.append(feature_id)
+                continue
+
+            # FAILED — persist feedback, dispatch recovery generator
+            import shutil
+            _wt_fb = wt_dir / "feedback.md"
+            if _wt_fb.exists():
+                shutil.copy2(_wt_fb, state_dir / f"feedback-{feature_id}.md")
+            print(f"  Resume {feature_id}: evaluator FAILED — dispatching recovery generator")
+            worker_assignments.update_assignment_status(state_dir, wid, "running")
+            _needs_dispatch.add(wid)
+
+    # --- Dispatch recovery generators ---
+    # _needs_dispatch contains: items from first loop (status=running/interrupted)
+    # + items that just failed parallel eval (added above)
+    for wid in _needs_dispatch:
+        assignment = resumable[wid]
+        wt_dir = Path(assignment["worktree_dir"])
+        if not wt_dir.exists():
+            continue
+        branch = assignment["branch"]
+        feature_id = assignment["feature_id"]
+
+        # Worktree exists + branch has commits → re-dispatch with recovery prompt
+        print(f"  Resuming {feature_id} in {wt_dir}")
+
+        # Build git log context for recovery prompt
+        git_log = _sp.run(
+            ["git", "log", "--oneline", "main..HEAD"],
+            cwd=wt_dir, capture_output=True, text=True,
+        ).stdout.strip() or "(no commits)"
+
+        # Look up feature description from work_plan phases
+        feature_desc = feature_id
+        if work_plan:
+            for ph in work_plan.data.get("phases", []):
+                for ep in ph.get("epics", []):
+                    for st in ep.get("stories", []):
+                        for t in st.get("tasks", []):
+                            if t.get("id") == feature_id:
+                                feature_desc = t.get("description", feature_id)
+
+        # Write task brief for resumed agent (include relay from all available briefs)
+        _feature_data = {"id": feature_id, "description": feature_desc,
+                         "scope": assignment.get("scope", [])}
+        _resume_relay = get_relay_context(state_dir, current_wave=assignment.get("wave", 1), include_current_wave=True)
+        write_task_brief(wt_dir, _feature_data, state_dir, work_plan=work_plan, relay_context=_resume_relay)
+
+        # Check for resumable session ID from the interrupted agent
+        _resume_sid = assignment.get("gen_session_id") or None
+
+        if _resume_sid:
+            # Resume the exact interrupted session — agent has full context
+            user_msg = (
+                f"Your session was interrupted while working on {feature_id}. "
+                f"You are in the same worktree with all committed work intact. "
+                f"Check feedback.md if it exists, then continue where you left off."
             )
-            eval_result = await run_agent_session(eval_prompt, eval_options, project_dir)
-            cost_tracker.record("evaluator", eval_result.get("cost", 0))
-            cost_tracker.record_feature(feature_id, "evaluator", eval_result.get("cost", 0))
+            gen_system = None  # system prompt already baked into session
+            print(f"  {feature_id}: resuming interrupted session")
+        else:
+            # No session ID — fall back to recovery prompt
+            resume_replacements = {
+                "FEATURE_ID": feature_id,
+                "FEATURE_DESC": feature_desc,
+                "GIT_LOG": git_log,
+            }
+            recovery_preamble = load_prompt(prompts_dir / "generator-resume.md", resume_replacements)
+
+            gen_system_replacements = {
+                "STATE_DIR": str(state_dir),
+                "TEST_COMMAND": config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'"),
+                "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
+            }
+            prompt_file = "generator-v2.md" if (prompts_dir / "generator-v2.md").exists() else resolve_prompt("generator", config)
+            gen_system = load_prompt(prompts_dir / prompt_file, gen_system_replacements)
+            user_msg = recovery_preamble + f"\nYour assigned feature: {feature_id} — {feature_desc}\nRead TASK_BRIEF.md in this directory for full details."
+            print(f"  {feature_id}: no session to resume — using recovery prompt")
+
+        # Update assignment status
+        agent_id = generate_instance_id()
+        worker_assignments.update_assignment_status(state_dir, wid, "running")
+
+        gen_options = create_client_options(wt_dir, config)
+        dispatched.append((agent_id, feature_id, wt_dir, branch, wid, user_msg, gen_system, gen_options, _resume_sid))
+
+    if not dispatched:
+        return {"completed": completed, "failed": failed, "resumed": 0}
+
+    print(f"  Resuming {len(dispatched)} interrupted worker(s)...")
+
+    # Launch resumed agents in parallel
+    async def _resume_one(prompt, options, wt_dir, system_prompt=None, resume_session_id=None):
+        return await run_agent_session(prompt, options, wt_dir, system_prompt=system_prompt, resume_session_id=resume_session_id)
+
+    timeout_minutes = config.get("parallel", {}).get("agent_timeout_minutes", 30)
+    tasks = []
+    for agent_id, feature_id, wt_dir, branch, wid, prompt, sys_prompt, options, resume_sid in dispatched:
+        coro = _resume_one(prompt, options, wt_dir, system_prompt=sys_prompt, resume_session_id=resume_sid)
+        wrapped = asyncio.wait_for(coro, timeout=timeout_minutes * 60)
+        tasks.append((agent_id, feature_id, wt_dir, branch, wid, asyncio.ensure_future(wrapped)))
+
+    # Gather and process results
+    test_command = config.get("evaluator", {}).get("test_suite_command", "echo 'No test command'")
+    for agent_id, feature_id, wt_dir, branch, wid, task in tasks:
+        try:
+            result = await task
+            output = result.get("output", "")
+
+            has_status_block = "---HARNESS_STATUS---" in output
+            has_commits = branch_has_commits(project_dir, branch)
+
+            if (result.get("status") == "error" or not has_status_block) and not has_commits:
+                # Agent failed AND produced no commits — nothing to salvage
+                print(f"  Resumed agent on {feature_id}: failed (no status block, no commits)")
+                worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                failed.append(feature_id)
+                continue
+
+            if not has_status_block and has_commits:
+                print(f"  Resumed agent on {feature_id}: no status block but has commits — evaluating")
+
+            # Evaluate IN the worktree first — only merge if eval passes
+            print(f"  Resumed {feature_id}: running evaluator in worktree")
+            eval_repl, eval_file, eval_fallback, eval_user_msg = _build_eval_replacements(
+                feature_id, state_dir, config, test_command, work_plan=work_plan)
+            _eval_path = prompts_dir / eval_file if (prompts_dir / eval_file).exists() else prompts_dir / eval_fallback
+            eval_system = load_prompt(_eval_path, eval_repl)
+            eval_options = create_client_options(wt_dir, config)
+            try:
+                eval_result = await asyncio.wait_for(
+                    run_agent_session(eval_user_msg, eval_options, wt_dir, system_prompt=eval_system),
+                    timeout=15 * 60,
+                )
+            except asyncio.TimeoutError:
+                print(f"  Resumed {feature_id}: eval timed out (15m) — preserving worktree")
+                worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                failed.append(feature_id)
+                continue
+            cost_tracker.record("evaluator", eval_result.get("cost", 0), **_metrics_from(eval_result))
 
             if "VERDICT: FAIL" in eval_result.get("output", ""):
-                fleet_session.requeue_feature(session, feature_id, reason="eval_fail")
+                # Feedback stays in worktree for retry gen; also persist for crash recovery
+                import shutil as _sh
+                _wt_fb = wt_dir / "feedback.md"
+                _persist_fb = state_dir / f"feedback-{feature_id}.md"
+                if _wt_fb.exists():
+                    _sh.copy2(_wt_fb, _persist_fb)
+                elif eval_result.get("output"):
+                    _persist_fb.write_text(eval_result["output"])
+                    _wt_fb.write_text(eval_result["output"])
+                # Preserve worktree — pool retry will reuse it
+                worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                print(f"  Resumed {feature_id}: eval FAIL — worktree preserved, returning to pool")
                 failed.append(feature_id)
-                tracker.feature_fail(feature_id, feature.get("description", ""), "VERDICT: FAIL")
-                fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "eval_fail")
             else:
+                # Eval passed — now merge
+                merge_result = merge_worktree(project_dir, branch)
+                if not merge_result["success"]:
+                    print(f"  Resumed {feature_id}: eval PASS but merge failed — preserving")
+                    worker_assignments.update_assignment_status(state_dir, wid, "failed")
+                    failed.append(feature_id)
+                    continue
+
+                cleanup_worktree(project_dir, wt_dir, branch, force=True)
+                worker_assignments.remove_assignment(state_dir, wid)
                 await state_mgr.mark_feature_passing_async(feature_id)
                 if work_plan is not None:
                     work_plan.mark_task_done(feature_id, work_plan_path)
                     work_plan.sync_feature_list(state_dir / "feature_list.json")
-                fleet_session.mark_feature_complete(session, feature_id)
                 completed.append(feature_id)
-                tracker.feature_pass(feature_id, feature.get("description", ""), 0)
-                fleet_session.record_agent_result(session, wave_num, agent_id, feature_id, "complete")
+                print(f"  Resumed {feature_id}: PASSED + merged")
 
-            # Add discoveries
-            if handoff_data.get("found") and handoff_data.get("items"):
-                for item in handoff_data["items"][:3]:
-                    fleet_session.add_discovery(session, wave_num, f"Wave {wave_num} {feature_id}: {item}")
+                _cur = state_mgr.load_state()
+                await state_mgr.update_state_async(
+                    phase="generator",
+                    current_feature_id=feature_id,
+                    iteration=_cur.get("iteration", 0) + 1,
+                    generator_sessions=_cur.get("generator_sessions", 0) + 1,
+                    total_cost_usd=cost_tracker.total,
+                    cost_breakdown=cost_tracker.to_dict(),
+                    last_updated=datetime.now(timezone.utc).isoformat(),
+                )
 
-        # Complete wave
-        fleet_session.complete_wave(session, wave_num)
-        n_ok = len([s for _, _, _, _, _, s in results if s == "ok"])
-        n_fail = len(results) - n_ok
-        tracker.wave_complete(wave_num, len(completed), n_fail, len(conflicts))
+        except asyncio.TimeoutError:
+            print(f"  Resumed agent on {feature_id}: timed out")
+            worker_assignments.update_assignment_status(state_dir, wid, "failed")
+            failed.append(feature_id)
+        except Exception as e:
+            print(f"  Resumed agent on {feature_id}: error — {e}")
+            worker_assignments.update_assignment_status(state_dir, wid, "failed")
+            failed.append(feature_id)
 
-    return {"completed": completed, "failed": failed, "conflicts": conflicts}
+    return {"completed": completed, "failed": failed, "resumed": len(dispatched)}
 
 
 async def run_harness(
@@ -477,6 +1553,7 @@ async def run_harness(
     spec_path: Optional[Path] = None,
     plan_path: Optional[Path] = None,
     resume: bool = False,
+    run_id: Optional[str] = None,
     cli_overrides: Optional[dict] = None,
 ) -> dict:
     """Main harness entry point.
@@ -488,22 +1565,52 @@ async def run_harness(
     if cli_overrides:
         config.update(cli_overrides)
 
-    state_dir = project_dir / ".harness" / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # Run isolation: each run gets its own directory
+    active_run_id, state_mgr, registry = _setup_run(
+        project_dir, resume=resume, run_id=run_id, prompt=prompt or ""
+    )
+    state_dir = state_mgr.state_dir
 
-    state_mgr = StateManager(state_dir)
     cb = CircuitBreaker(state_dir, config.get("circuit_breaker", {}))
     cost_tracker = CostTracker()
     prompts_dir = Path(__file__).parent.parent / "prompts"
 
     cp = ControlPlaneClient(state_dir=state_dir)
     try:
-        cp.create_run(project_dir.name, str(project_dir))
+        if resume:
+            cp.resume_run(project_dir.name, str(project_dir))
+        else:
+            cp.create_run(project_dir.name, str(project_dir))
     except Exception:
         pass
 
     # Create EventTracker for full lifecycle observability (feature 040)
     tracker = EventTracker(cp)
+
+    # --- Signal handling for graceful shutdown ---
+    import signal
+    global _shutdown_requested
+    _shutdown_requested = False
+    _prev_sigint = signal.getsignal(signal.SIGINT)
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_shutdown(sig, frame):
+        global _shutdown_requested
+        if _shutdown_requested:
+            # Second signal — hard stop: kill workers, preserve assignments
+            print("\nHard stop — killing workers, preserving worktree assignments...")
+            worker_assignments.mark_all_running_as_interrupted(state_dir)
+            for proc in list(_active_worker_procs):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise KeyboardInterrupt
+        _shutdown_requested = True
+        print("\nShutdown requested. Waiting for active workers to finish (Ctrl+C again to force)...")
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
 
     start_time = time.time()
     state = state_mgr.load_state()
@@ -511,12 +1618,29 @@ async def run_harness(
     # Resume from previous run
     if resume and state["phase"] != "init":
         cost_tracker = CostTracker.from_dict(state.get("cost_breakdown", {}))
-        print(f"Resuming from phase: {state['phase']}, iteration: {state['iteration']}")
+        print(f"Resuming run {active_run_id} from phase: {state['phase']}, iteration: {state['iteration']}")
+        # Reset stale state — current_feature_id reflects the last killed session,
+        # not what will actually run next. Clear drain state if resuming after drain.
+        # Increment iteration so state.json reflects a new cycle started.
+        state_mgr.update_state(
+            phase="generator",
+            current_feature_id=None,
+            evaluator_retries_current_feature=0,
+            iteration=state.get("iteration", 0) + 1,
+            last_updated=datetime.now(timezone.utc).isoformat(),
+        )
+        _clear_drain(state_dir)  # in case drain file lingered
     else:
         state = state_mgr.update_state(
             started_at=datetime.now(timezone.utc).isoformat(),
             phase="init",
         )
+
+    # Initialize run log
+    _write_run_log(state_dir, "run_start",
+                   run_id=active_run_id, project=str(project_dir),
+                   model=config.get("model", "default"),
+                   resume=resume)
 
     print("=" * 60)
     print("  LONG-RUNNING AGENT HARNESS")
@@ -594,7 +1718,7 @@ async def run_harness(
                 system_prompt="You are a product architect designing a comprehensive application specification.",
             )
             result = await run_agent_session(planner_prompt, planner_options, project_dir, progress_label="Planner")
-            cost_tracker.record("planner", result["cost"])
+            cost_tracker.record("planner", result["cost"], **_metrics_from(result))
             print(f"  [Planner] complete. Cost: ${result['cost']:.2f}")
             use_work_plan = False
 
@@ -628,7 +1752,7 @@ async def run_harness(
                     + "3. Write a non-empty feature_list.json\n"
                 ).replace("{{STATE_DIR}}", str(state_dir))
                 result2 = await run_agent_session(retry_prompt, planner_options, project_dir)
-                cost_tracker.record("planner", result2["cost"])
+                cost_tracker.record("planner", result2["cost"], **_metrics_from(result2))
                 validation2 = validate_planner_output(state_dir, use_work_plan=False)
                 if not validation2["valid"]:
                     print(f"  Planner still invalid after retry: {validation2['reason']}")
@@ -648,6 +1772,17 @@ async def run_harness(
         else:
             n = state_mgr.count_features().get("total", 0)
         tracker.run_started(n)
+
+        # Push work plan to control plane for dashboard task view
+        if use_work_plan:
+            try:
+                wp_data = json_mod.loads((state_dir / "work_plan.json").read_text())
+                tracker.push_work_plan(wp_data)
+            except Exception as e:
+                _log_error(state_dir, "push_work_plan_planner", e)
+
+        _write_run_log(state_dir, "planner_complete",
+                       tasks=n, cost_usd=cost_tracker.total)
         print()
 
     # === PHASE 2: GENERATOR ↔ EVALUATOR LOOP ===
@@ -664,6 +1799,12 @@ async def run_harness(
             # Sync feature_list.json from work_plan so generator prompt can read it
             work_plan.sync_feature_list(state_dir / "feature_list.json")
             print(f"  Loaded work_plan.json: {work_plan.count_tasks()['total']} tasks (synced → feature_list.json)")
+            # Push work plan to control plane (covers resume path)
+            try:
+                wp_data = json_mod.loads(work_plan_path.read_text())
+                tracker.push_work_plan(wp_data)
+            except Exception as e:
+                _log_error(state_dir, "push_work_plan_resume", e)
         except Exception as e:
             print(f"  WARNING: work_plan.json load failed ({e}), falling back to feature list")
     elif feature_list_path.exists():
@@ -701,14 +1842,48 @@ async def run_harness(
 
     # === PARALLEL DISPATCH (Fleet mode) ===
     parallel_config = config.get("parallel", {})
+    session = None  # fleet session; also used by sequential loop for status tracking
     if parallel_config.get("enabled") and work_plan is not None:
         print("--- PARALLEL MODE: Fleet wave execution ---")
+
+        # Resume interrupted workers before starting new waves
+        if resume:
+            resume_result = await resume_interrupted_workers(
+                project_dir=project_dir,
+                state_dir=state_dir,
+                config=config,
+                prompts_dir=prompts_dir,
+                cost_tracker=cost_tracker,
+                tracker=tracker,
+                state_mgr=state_mgr,
+                work_plan=work_plan,
+                work_plan_path=state_dir / "work_plan.json",
+            )
+            if resume_result["resumed"] > 0:
+                print(f"  Resumed {resume_result['resumed']} worker(s): "
+                      f"{len(resume_result['completed'])} completed, "
+                      f"{len(resume_result['failed'])} failed")
+
         flat_tasks = work_plan.flatten_for_grouping()
         layers = group_by_dependency(flat_tasks)
         print(f"  {len(flat_tasks)} tasks → {len(layers)} dependency layer(s)")
 
         if len(layers) > 0:
-            session = fleet_session.init_session(state_dir, len(layers))
+            # Seed session with confirmed state from work_plan so session.json
+            # is immediately consistent with reality (survives kill/resume cycles)
+            all_wp_tasks = [
+                t for ph in work_plan.data.get("phases", [])
+                for ep in ph.get("epics", [])
+                for st in ep.get("stories", [])
+                for t in st.get("tasks", [])
+            ]
+            wp_done = [t["id"] for t in all_wp_tasks if t.get("status") == "done"]
+            wp_blocked = [t["id"] for t in all_wp_tasks if t.get("status") == "blocked"]
+            session = fleet_session.init_session(
+                state_dir, len(layers),
+                already_completed=wp_done,
+                already_failed=wp_blocked,
+            )
 
             for wave_num, layer in enumerate(layers, start=1):
                 # Add features to session queue
@@ -717,10 +1892,10 @@ async def run_harness(
                         session, feat["id"], feat.get("description", ""),
                         feat.get("scope", []), wave_num,
                     )
+                fleet_session.save_session(session, state_dir)  # visibility: queue populated
 
-                if len([f for f in layer if f.get("scope")]) < 2:
-                    # Not enough scoped features for parallelism — skip to sequential
-                    print(f"  Wave {wave_num}: <2 scoped features, deferring to sequential loop")
+                pending_in_layer = [f for f in layer if not f.get("passes") and not f.get("blocked")]
+                if not pending_in_layer:
                     continue
 
                 print(f"  Wave {wave_num}: {len(layer)} features")
@@ -740,6 +1915,8 @@ async def run_harness(
                 )
                 print(f"  Wave {wave_num} result: {len(wave_result['completed'])} done, "
                       f"{len(wave_result['failed'])} failed, {len(wave_result['conflicts'])} conflicts")
+                # Persist session state after each wave so fleet dir is live
+                fleet_session.save_session(session, state_dir)
 
                 # If all agents failed, stop parallel and fall through to sequential
                 if not wave_result["completed"] and (wave_result["failed"] or wave_result["conflicts"]):
@@ -754,6 +1931,16 @@ async def run_harness(
 
     # === SEQUENTIAL LOOP (existing behavior, handles remaining features) ===
     while True:
+        # Check drain before spawning new agents
+        if _check_drain(state_dir):
+            print("\nDrain requested — stopping after current cycle completes.")
+            state_mgr.update_state(
+                phase="drained",
+                last_updated=datetime.now(timezone.utc).isoformat(),
+            )
+            _clear_drain(state_dir)
+            break
+
         iteration += 1
         elapsed = time.time() - start_time
 
@@ -838,18 +2025,42 @@ async def run_harness(
         print(f"\n[Iteration {iteration}] Feature {feature_id}: {feature_desc[:60]}")
         tracker.feature_start(feature_id, feature_desc)
 
+        # Track sequential progress in session for dashboard visibility
+        if session is not None:
+            session["mode"] = "sequential"
+            session["current_sequential_feature"] = feature_id
+            session["sequential_iteration"] = iteration
+            fleet_session.save_session(session, state_dir)
+
         # --- GENERATOR SESSION ---
-        gen_replacements = {
+        # Write task brief so agent doesn't need to read giant state files
+        _seq_relay = get_relay_context(state_dir, current_wave=0, include_current_wave=True)
+        write_task_brief(project_dir, next_feature, state_dir, work_plan=work_plan, relay_context=_seq_relay)
+
+        gen_system_replacements = {
             "STATE_DIR": str(state_dir),
             "TEST_COMMAND": test_command or "echo 'No test command configured'",
             "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
         }
-        gen_prompt = load_prompt(prompts_dir / resolve_prompt("generator", config), gen_replacements)
+        prompt_file = "generator-v2.md" if (prompts_dir / "generator-v2.md").exists() else resolve_prompt("generator", config)
+        gen_system = load_prompt(prompts_dir / prompt_file, gen_system_replacements)
+        gen_user_msg = f"Your assigned feature: {feature_id} — {feature_desc}\nRead TASK_BRIEF.md in this directory for full details."
         gen_options = create_client_options(project_dir, config)
 
-        gen_result = await run_agent_session(gen_prompt, gen_options, project_dir)
-        cost_tracker.record("generator", gen_result["cost"])
+        gen_result = await run_agent_session(gen_user_msg, gen_options, project_dir, system_prompt=gen_system)
+        cost_tracker.record("generator", gen_result["cost"], **_metrics_from(gen_result))
         cost_tracker.record_feature(feature_id, "generator", gen_result["cost"])
+
+        # Write discovery brief + shared knowledge
+        try:
+            _brief = compress_discovery(gen_result.get("output", ""), feature_id, feature_id,
+                                        "ok" if gen_result.get("status") != "error" else "error")
+            write_brief(_brief, 0, feature_id, state_dir)
+            _knowledge_dir = state_dir / "knowledge"
+            _knowledge_dir.mkdir(parents=True, exist_ok=True)
+            (_knowledge_dir / f"{feature_id}.md").write_text(_brief)
+        except Exception as e:
+            _log_error(state_dir, f"write_brief:{feature_id}", e)
 
         state_mgr.update_state(
             phase="generator",
@@ -860,6 +2071,18 @@ async def run_harness(
             cost_breakdown=cost_tracker.to_dict(),
             last_updated=datetime.now(timezone.utc).isoformat(),
         )
+
+        # Sync agent-marked statuses from feature_list.json back into work_plan
+        if work_plan is not None:
+            ingested = work_plan.ingest_feature_list(
+                state_dir / "feature_list.json", work_plan_path)
+            if ingested:
+                print(f"  Synced {len(ingested)} agent-marked task(s) into work_plan")
+                for t in ingested:
+                    if t["status"] == "done":
+                        tracker.feature_pass(t["id"], t["description"], 0)
+                    elif t["status"] == "blocked":
+                        tracker.feature_fail(t["id"], t["description"], "agent_blocked")
 
         # Assess progress
         if work_plan is not None:
@@ -904,26 +2127,39 @@ async def run_harness(
         print(f"  Generator: cost=${gen_result['cost']:.2f}, "
               f"progress={progress.has_progress}, "
               f"features={feature_counts['passing']}/{feature_counts['total']}")
+        gen_usage = gen_result.get("usage") or {}
+        _write_run_log(state_dir, "generator_iteration",
+                       iteration=iteration, feature_id=feature_id,
+                       cost_usd=gen_result["cost"],
+                       input_tokens=gen_usage.get("input_tokens", 0),
+                       output_tokens=gen_usage.get("output_tokens", 0),
+                       duration_ms=gen_result.get("duration_ms", 0),
+                       num_turns=gen_result.get("num_turns", 0),
+                       progress=progress.has_progress,
+                       passing=feature_counts["passing"],
+                       total=feature_counts["total"])
 
         # --- EVALUATOR SESSION ---
-        if progress.has_progress and feature_counts["remaining"] >= 0:
-            eval_replacements = {
-                "STATE_DIR": str(state_dir),
-                "TEST_COMMAND": test_command or "echo 'No test command configured'",
-                "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
-                "FEATURE_ID": feature_id,
-                "RETRY_COUNT": str(current_state.get("evaluator_retries_current_feature", 0) + 1),
-                "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
-            }
-            eval_prompt = load_prompt(prompts_dir / "evaluator.md", eval_replacements)
-            eval_options = create_client_options(
-                project_dir,
-                config,
-                system_prompt="You are a skeptical QA evaluator. Find problems. Do not approve mediocre work.",
-            )
+        # Skip evaluator if generator errored (rate limit, timeout, etc.)
+        # to prevent marking features done based on stale state
+        if gen_result.get("status") == "error":
+            print(f"  Generator returned error — skipping evaluator: {gen_result.get('error', 'unknown')}")
+            tracker.feature_fail(feature_id, feature_desc, gen_result.get("error", "generator_error"))
+            _write_run_log(state_dir, "generator_error",
+                           iteration=iteration, feature_id=feature_id,
+                           error=gen_result.get("error", "unknown"))
+        elif progress.has_progress and feature_counts["remaining"] >= 0:
+            _retry = current_state.get("evaluator_retries_current_feature", 0) + 1
+            eval_repl, eval_file, eval_fallback, eval_user_msg = _build_eval_replacements(
+                feature_id, state_dir, config,
+                test_command or "echo 'No test command configured'",
+                work_plan=work_plan, retry_count=_retry)
+            _eval_path = prompts_dir / eval_file if (prompts_dir / eval_file).exists() else prompts_dir / eval_fallback
+            eval_system = load_prompt(_eval_path, eval_repl)
+            eval_options = create_client_options(project_dir, config)
 
-            eval_result = await run_agent_session(eval_prompt, eval_options, project_dir)
-            cost_tracker.record("evaluator", eval_result["cost"])
+            eval_result = await run_agent_session(eval_user_msg, eval_options, project_dir, system_prompt=eval_system)
+            cost_tracker.record("evaluator", eval_result["cost"], **_metrics_from(eval_result))
             cost_tracker.record_feature(feature_id, "evaluator", eval_result["cost"])
 
             state_mgr.update_state(
@@ -985,6 +2221,17 @@ async def run_harness(
     elapsed_total = time.time() - start_time
     elapsed_min = int(elapsed_total / 60)
 
+    _write_run_log(state_dir, "run_complete",
+                   duration_min=elapsed_min, iterations=iteration,
+                   passing=final_counts["passing"],
+                   total=final_counts["total"],
+                   blocked=final_counts["blocked"],
+                   cost_usd=cost_tracker.total,
+                   input_tokens=cost_tracker.input_tokens,
+                   output_tokens=cost_tracker.output_tokens,
+                   total_turns=cost_tracker.total_turns,
+                   api_time_ms=cost_tracker.total_api_ms)
+
     print()
     print("=" * 60)
     print("  HARNESS COMPLETE")
@@ -1006,13 +2253,17 @@ async def run_harness(
     if suspicion_result and suspicion_result.get("suspicious"):
         tracker.suspicion_warning(suspicion_result.get("reasons", []))
 
-    print(f"Resume: python .harness/run.py --resume")
+    print(f"Resume: python .harness/run.py --resume --run-id {active_run_id}")
     print()
 
     # Feature 041: use tracker for completion events
     retro_path = project_dir / "retrospective.json"
     if final_counts["remaining"] == 0:
-        tracker.run_complete(final_counts["passing"], cost_tracker.total)
+        tracker.run_complete(final_counts["passing"], cost_tracker.total,
+                             input_tokens=cost_tracker.input_tokens,
+                             output_tokens=cost_tracker.output_tokens,
+                             total_turns=cost_tracker.total_turns,
+                             api_time_ms=cost_tracker.total_api_ms)
         if retro_path.exists():
             tracker.retro_generated()
             try:
@@ -1033,7 +2284,18 @@ async def run_harness(
         print(f"  Worktree sweep (end) failed (non-fatal): {e}")
     tracker.worktree_sweep("end", len(removed_end))
 
+    # Update run registry with final status
+    run_status = "complete" if final_counts["remaining"] == 0 else "in_progress"
+    registry.update_run(
+        active_run_id,
+        status=run_status,
+        total_cost_usd=cost_tracker.total,
+        features_total=final_counts["total"],
+        features_passing=final_counts["passing"],
+    )
+
     return {
+        "run_id": active_run_id,
         "duration_minutes": elapsed_min,
         "iterations": iteration,
         "features": final_counts,

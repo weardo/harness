@@ -127,12 +127,26 @@ def write_task_brief(
 
     Replaces having agents read 150KB+ feature_list.json and work_plan.json.
     The brief is ~2-5KB — everything the agent needs to implement one task.
+
+    Knowledge sharing: points agents to a shared directory where all agents
+    write discoveries. Agents read what they need on demand — no caps, no
+    pre-filtering.
     """
     feature_id = feature.get("id", "unknown")
     desc = feature.get("description", "")
     scope = feature.get("scope", [])
     deps = feature.get("depends_on", [])
     ac = feature.get("acceptance_criteria", feature.get("ac", ""))
+
+    # Detect revalidation mode: scope files already exist in the worktree
+    revalidation = False
+    if scope:
+        existing = 0
+        for s in scope:
+            p = worktree_dir / s
+            if p.exists() and (p.is_dir() or p.stat().st_size > 50):
+                existing += 1
+        revalidation = existing >= len(scope) * 0.5  # >50% of scope files exist
 
     # Get progress summary without reading the full feature_list
     try:
@@ -145,13 +159,35 @@ def write_task_brief(
     except Exception:
         progress = "(unknown)"
 
+    mode_str = "REVALIDATION" if revalidation else "FRESH"
+
     lines = [
         f"# Task Brief: {feature_id}",
         "",
         f"**Feature:** {feature_id}",
         f"**Description:** {desc}",
+        f"**Mode:** {mode_str}",
         "",
     ]
+
+    if revalidation:
+        lines += [
+            "## REVALIDATION MODE",
+            "",
+            "Code for this task ALREADY EXISTS in the worktree. This is a re-evaluation run.",
+            "",
+            "**Generator rules:**",
+            "- Do NOT rewrite or reimplement existing code.",
+            "- Do NOT revert changes made by later tasks (fields removed, functions renamed, etc).",
+            "- Only fix genuinely broken or missing functionality.",
+            "- If the code satisfies the INTENT of the acceptance criteria, mark it passing.",
+            "",
+            "**Evaluator rules:**",
+            "- Check if the INTENT of each criterion is met, not the exact letter.",
+            "- If a later commit deliberately changed/removed something, that is evolution — PASS it.",
+            "- Only FAIL if core functionality is genuinely broken or completely absent.",
+            "",
+        ]
 
     if ac:
         lines += ["## Acceptance Criteria", "", ac if isinstance(ac, str) else "\n".join(f"- {a}" for a in ac), ""]
@@ -164,8 +200,35 @@ def write_task_brief(
 
     lines += [f"## Project Progress", "", progress, ""]
 
+    # Two-tier shared knowledge: persistent (across runs) + per-run (task briefs)
+    # state_dir = <project>/.harness/runs/<run-id>, so .parent.parent = <project>/.harness/
+    harness_root = Path(state_dir).parent.parent
+    persistent_knowledge = harness_root / "knowledge"
+    persistent_knowledge.mkdir(parents=True, exist_ok=True)
+    run_knowledge = Path(state_dir) / "knowledge"
+    run_knowledge.mkdir(parents=True, exist_ok=True)
+
+    lines += [
+        "## Shared Knowledge (READ BEFORE CODING)",
+        "",
+        "### Persistent learnings (across all runs)",
+        f"Directory: `{persistent_knowledge}`",
+        "Contains curated patterns, conventions, and gotchas that persist across runs.",
+        "Read ALL .md files here before starting — they contain critical patterns.",
+        "",
+        "### This run's discoveries (from other agents)",
+        f"Directory: `{run_knowledge}`",
+        "Contains discoveries from agents working on tasks in this run.",
+        "Read files here for recent patterns from parallel agents.",
+        "",
+        "### Your contribution",
+        f"When you finish, write your discoveries to `{run_knowledge}/{feature_id}.md`.",
+        "What to write: SDK import patterns, component conventions, gotchas, key decisions.",
+        "",
+    ]
+
     if relay_context:
-        lines += ["## Discoveries from Prior Waves", "", relay_context, ""]
+        lines += ["## Discoveries from Prior Agents", "", relay_context, ""]
 
     brief_path = worktree_dir / "TASK_BRIEF.md"
     try:
@@ -202,7 +265,48 @@ def create_worktree(project_dir: Path, worker_id: int, base_branch: str = "HEAD"
     # Without --reference, git clones each submodule from remote per worktree.
     _init_submodules_local(project_dir, worktree_dir)
 
+    # Regenerate and link the local SDK so admin-ui tasks have up-to-date
+    # connector types without needing to run `make sdk` manually.
+    _link_local_sdk(project_dir, worktree_dir)
+
     return worktree_dir, branch_name
+
+
+def _link_local_sdk(project_dir: Path, worktree_dir: Path) -> None:
+    """Run `make sdk` in the go-backend submodule of the worktree.
+
+    This regenerates the OpenAPI-derived TypeScript SDK from Go annotations and
+    links it into the admin-ui pnpm workspace so tasks that depend on connector
+    SDK types don't fail evaluation due to a stale published package.
+
+    Skips silently if go-backend or its Makefile is absent (e.g. non-monorepo projects).
+    """
+    go_backend = worktree_dir / "go-backend"
+    makefile = go_backend / "Makefile"
+    if not makefile.exists():
+        return
+
+    import os
+    # Ensure ~/go/bin is on PATH so swag-openapi3 is found
+    env = os.environ.copy()
+    go_bin = str(Path.home() / "go" / "bin")
+    env["PATH"] = go_bin + ":" + env.get("PATH", "")
+
+    print(f"  🔧 Linking local SDK in {worktree_dir.name}...")
+    result = subprocess.run(
+        ["make", "sdk"],
+        cwd=str(go_backend),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    if result.returncode != 0:
+        # Non-fatal — log and continue; agent can fall back to published package
+        print(f"  ⚠️  make sdk failed in {worktree_dir.name} (non-fatal):")
+        print(result.stderr[-500:] if result.stderr else result.stdout[-500:])
+    else:
+        print(f"  ✅ Local SDK linked in {worktree_dir.name}")
 
 
 def branch_has_commits(project_dir: Path, branch_name: str) -> bool:
@@ -236,6 +340,32 @@ def cleanup_worktree(
 
     if not force and branch_has_commits(project_dir, branch_name):
         return False  # Preserve — branch has unmerged work
+
+    # NEVER delete a worktree with uncommitted changes — even with force=True.
+    # A generator may be actively writing files that haven't been committed yet.
+    if worktree_dir.exists():
+        _dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(worktree_dir),
+            capture_output=True, text=True, timeout=10,
+        )
+        _sub_dirty = subprocess.run(
+            ["git", "submodule", "foreach", "--quiet",
+             "git", "status", "--porcelain"],
+            cwd=str(worktree_dir),
+            capture_output=True, text=True, timeout=15,
+        )
+        if _dirty.stdout.strip() or _sub_dirty.stdout.strip():
+            return False  # Preserve — uncommitted work in progress
+
+    # Rescue submodule objects before destroying the worktree.
+    # Worktree submodules have their own object store under
+    # .git/worktrees/<wt>/modules/<name>/ — removing the worktree
+    # deletes those objects, breaking submodule pointer references.
+    try:
+        _rescue_submodule_objects(project_dir, branch_name)
+    except Exception:
+        pass  # Best-effort — don't block cleanup on rescue failure
 
     # Remove worktree
     subprocess.run(
@@ -360,7 +490,29 @@ def merge_worktree(project_dir: Path, branch_name: str) -> dict:
 
     # Check for merge conflict
     if "CONFLICT" in result.stdout or "CONFLICT" in result.stderr:
-        # Abort the merge
+        merged = result.stdout + result.stderr
+
+        # Try to auto-resolve submodule conflicts.
+        # Pattern: "CONFLICT (submodule): Merge conflict in <name>"
+        # Fix: merge the branch's submodule commit into the main submodule,
+        # then stage the resolved pointer.
+        if "CONFLICT (submodule)" in merged:
+            resolved = _auto_resolve_submodule_conflicts(project_dir, branch_name, merged)
+            if resolved:
+                # Check if all conflicts are resolved
+                status = subprocess.run(
+                    ["git", "diff", "--name-only", "--diff-filter=U"],
+                    cwd=project_dir, capture_output=True, text=True,
+                )
+                if not status.stdout.strip():
+                    # All conflicts resolved — commit the merge
+                    subprocess.run(
+                        ["git", "commit", "--no-edit"],
+                        cwd=project_dir, capture_output=True, text=True,
+                    )
+                    return {"success": True, "conflict": False, "error": ""}
+
+        # Could not auto-resolve — abort
         subprocess.run(
             ["git", "merge", "--abort"],
             cwd=project_dir,
@@ -370,7 +522,7 @@ def merge_worktree(project_dir: Path, branch_name: str) -> dict:
         return {
             "success": False,
             "conflict": True,
-            "error": result.stdout + result.stderr,
+            "error": merged,
         }
 
     return {
@@ -378,6 +530,80 @@ def merge_worktree(project_dir: Path, branch_name: str) -> dict:
         "conflict": False,
         "error": result.stderr or result.stdout,
     }
+
+
+def _auto_resolve_submodule_conflicts(
+    project_dir: Path, branch_name: str, merge_output: str,
+) -> bool:
+    """Auto-resolve submodule merge conflicts by merging inside each submodule.
+
+    When two branches update a submodule pointer to different commits, git
+    can't auto-merge. The fix is:
+    1. Find the branch's submodule commit from the merge tree
+    2. Merge it into the submodule (which is at main's pointer)
+    3. Stage the resolved submodule pointer in the meta-repo
+
+    Returns True if all submodule conflicts were resolved.
+    """
+    import re
+    # Extract conflicted submodule names from merge output
+    # Pattern: "CONFLICT (submodule): Merge conflict in go-backend"
+    conflicts = re.findall(r"CONFLICT \(submodule\): Merge conflict in (\S+)", merge_output)
+    if not conflicts:
+        return False
+
+    all_resolved = True
+    for sm_name in conflicts:
+        sm_dir = project_dir / sm_name
+        if not sm_dir.is_dir():
+            all_resolved = False
+            continue
+
+        # Get the branch's submodule pointer
+        branch_ptr = subprocess.run(
+            ["git", "ls-tree", branch_name, "--", sm_name],
+            cwd=project_dir, capture_output=True, text=True,
+        )
+        if branch_ptr.returncode != 0 or not branch_ptr.stdout.strip():
+            all_resolved = False
+            continue
+
+        # Parse: "160000 commit <sha>\t<name>"
+        parts = branch_ptr.stdout.strip().split()
+        if len(parts) < 3:
+            all_resolved = False
+            continue
+        branch_commit = parts[2]
+
+        # Merge the branch's commit into the submodule
+        merge_result = subprocess.run(
+            ["git", "merge", branch_commit, "--no-edit"],
+            cwd=sm_dir, capture_output=True, text=True,
+        )
+
+        if merge_result.returncode != 0:
+            # Try rebase as fallback for fast-forward cases
+            subprocess.run(
+                ["git", "merge", "--abort"], cwd=sm_dir,
+                capture_output=True, text=True,
+            )
+            # Check if branch commit is ancestor (already merged)
+            ancestor_check = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", branch_commit, "HEAD"],
+                cwd=sm_dir, capture_output=True, text=True,
+            )
+            if ancestor_check.returncode != 0:
+                # Real conflict inside submodule — can't auto-resolve
+                all_resolved = False
+                continue
+
+        # Stage the resolved submodule in the meta-repo
+        subprocess.run(
+            ["git", "add", sm_name],
+            cwd=project_dir, capture_output=True, text=True,
+        )
+
+    return all_resolved
 
 
 async def run_parallel_layer(

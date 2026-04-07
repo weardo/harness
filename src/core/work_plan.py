@@ -261,12 +261,35 @@ class WorkPlan:
 
         Respects phase gates: only returns tasks from the first phase
         that has pending tasks. Tasks from later phases are excluded.
+
+        Done tasks from earlier phases are included as resolved stubs
+        so cross-phase dependencies are visible to group_by_dependency().
         """
         phase = self.current_phase()
         if phase is None:
             return []
 
+        phase_id = phase.get("id")
         result = []
+
+        # Include done tasks from earlier phases as resolved stubs
+        for ph in self.data.get("phases", []):
+            if ph.get("id") == phase_id:
+                break
+            for epic in ph.get("epics", []):
+                for story in epic.get("stories", []):
+                    for task in story.get("tasks", []):
+                        if task.get("status") == "done":
+                            result.append({
+                                "id": task["id"],
+                                "depends_on": [],
+                                "scope": [],
+                                "description": "",
+                                "passes": True,
+                                "blocked": False,
+                            })
+
+        # Current phase tasks
         for epic in phase.get("epics", []):
             for story in epic.get("stories", []):
                 for task in story.get("tasks", []):
@@ -393,12 +416,42 @@ class WorkPlan:
     # Backward compat (feature 020)
     # -------------------------------------------------------------------------
 
-    def sync_feature_list(self, feature_list_path: Path) -> None:
-        """Write a flat feature_list.json derived from work_plan tasks.
+    def ingest_feature_list(self, feature_list_path: Path, work_plan_path: Path) -> list[dict]:
+        """Read feature_list.json and sync agent-marked statuses back into work_plan.
 
-        The generator prompt reads/writes feature_list.json directly.
-        This keeps it in sync with the work_plan so the generator sees
-        the correct task IDs and statuses.
+        The generator agent writes passes/blocked directly to feature_list.json.
+        This reads those back and updates work_plan.json as source of truth.
+        Returns list of dicts with {id, description, status} for each updated task.
+        """
+        data = atomic_read(feature_list_path)
+        if data is None:
+            return []
+        fl_status = {}
+        for f in data:
+            if f.get("passes"):
+                fl_status[f["id"]] = "done"
+            elif f.get("blocked"):
+                fl_status[f["id"]] = "blocked"
+        updated = []
+        for _, _, _, task in self._all_tasks():
+            new_status = fl_status.get(task["id"])
+            if new_status and task.get("status") != new_status:
+                task["status"] = new_status
+                updated.append({
+                    "id": task["id"],
+                    "description": task.get("description", ""),
+                    "status": new_status,
+                })
+        if updated:
+            self.save(work_plan_path)
+        return updated
+
+    def sync_feature_list(self, feature_list_path: Path) -> None:
+        """Write a flat feature_list.json derived entirely from work_plan tasks.
+
+        work_plan.json is the single source of truth. feature_list.json is a
+        derived view — passes is True iff work_plan status == 'done'.
+        Generators do NOT modify feature_list.json directly.
         """
         features = []
         priority = 1

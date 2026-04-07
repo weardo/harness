@@ -10,7 +10,7 @@ user-invocable: true
 
 ## Protocol
 
-1. **Read state:** Read `.harness/state/state.json`. If missing → "No runs yet."
+1. **Read state:** Read `.harness/runs.json` to find the latest run, then read `<run-dir>/state.json`. If no runs → "No runs yet."
 
 2. **Display cost breakdown:**
    - **Total:** `total_cost_usd`
