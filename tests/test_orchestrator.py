@@ -987,3 +987,49 @@ class TestRunAgentSessionCli:
                 assert result["status"] == "continue"
 
         asyncio.run(run())
+
+
+class TestRelayCache:
+    def test_hits_when_briefs_unchanged(self, tmp_path):
+        from src.core.discovery import write_brief
+        from src.core.orchestrator import _get_cached_relay, _relay_cache
+
+        _relay_cache.clear()
+        write_brief("## Agent: a | Feature: f1\n**Files:** src/foo.go", 1, "a", tmp_path)
+
+        r1 = _get_cached_relay(tmp_path, wave_num=1)
+        r2 = _get_cached_relay(tmp_path, wave_num=1)
+        assert r1 == r2
+        assert r1 != ""
+        assert 1 in _relay_cache  # wave cached
+
+    def test_invalidates_when_new_brief_lands(self, tmp_path):
+        import os
+
+        from src.core.discovery import write_brief
+        from src.core.orchestrator import _get_cached_relay, _relay_cache
+
+        _relay_cache.clear()
+        write_brief("## Agent: a | Feature: f1\n**Files:** src/foo.go", 1, "a", tmp_path)
+
+        r1 = _get_cached_relay(tmp_path, wave_num=1)
+        assert "src/foo.go" in r1
+        assert "src/bar.go" not in r1
+
+        # New brief lands. To survive 1-second mtime resolution on some
+        # filesystems, explicitly bump the new brief's mtime forward instead
+        # of sleeping.
+        new_brief = write_brief(
+            "## Agent: b | Feature: f2\n**Files:** src/bar.go", 1, "b", tmp_path)
+        future = new_brief.stat().st_mtime + 5
+        os.utime(new_brief, (future, future))
+
+        r2 = _get_cached_relay(tmp_path, wave_num=1)
+        assert "src/foo.go" in r2
+        assert "src/bar.go" in r2
+
+    def test_returns_empty_when_no_briefs(self, tmp_path):
+        from src.core.orchestrator import _get_cached_relay, _relay_cache
+
+        _relay_cache.clear()
+        assert _get_cached_relay(tmp_path, wave_num=1) == ""

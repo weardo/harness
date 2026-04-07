@@ -106,6 +106,40 @@ def _log_error(state_dir: Path, context: str, exc: Exception) -> None:
                    traceback=traceback.format_exc())
 
 
+# Per-wave relay cache — avoids re-reading + re-concatenating briefs for every
+# parallel worker in the same wave. Keyed by wave number. Value is
+# (newest_brief_mtime_seen_at_cache_time, rendered_text).
+_relay_cache: dict[int, tuple[float, str]] = {}
+
+
+def _get_cached_relay(state_dir: Path, wave_num: int) -> str:
+    """Return the relay context for wave_num, building it once per wave and
+    rebuilding only when a newer brief has landed. Safe to call from many
+    concurrent workers — races only cause extra rebuilds, never wrong output.
+
+    NOTE: state must be invalidated between runs (different state_dir) — the
+    cache is keyed only by wave_num, so a new run with overlapping wave numbers
+    must start from a fresh process. Harness already does this: each run is a
+    fresh `python3 run.py` invocation.
+    """
+    briefs_dir = fleet_session.fleet_dir(state_dir) / "briefs"
+    if not briefs_dir.exists():
+        return ""
+    try:
+        mtimes = [p.stat().st_mtime for p in briefs_dir.glob("w*-*.md")]
+    except OSError:
+        mtimes = []
+    newest = max(mtimes, default=0.0)
+
+    cached = _relay_cache.get(wave_num)
+    if cached is not None and cached[0] >= newest and newest > 0.0:
+        return cached[1]
+
+    text = get_relay_context(state_dir, wave_num, include_current_wave=True)
+    _relay_cache[wave_num] = (newest, text)
+    return text
+
+
 def _build_eval_replacements(
     feature_id: str,
     state_dir: Path,
@@ -819,7 +853,7 @@ async def run_parallel_wave(
             # --- Generator (own timeout) ---
             feature_desc = feature.get("description", "")
             # Build relay fresh per-agent so later agents see earlier agents' briefs
-            _relay = get_relay_context(state_dir, wave_num, include_current_wave=True) if relay_enabled else ""
+            _relay = _get_cached_relay(state_dir, wave_num) if relay_enabled else ""
             write_task_brief(wt_dir, feature, state_dir,
                              work_plan=work_plan, relay_context=_relay)
             # feedback.md is already in worktree from evaluator (retry case)

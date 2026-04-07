@@ -377,3 +377,29 @@ class TestFleetDirResolution:
         write_brief("Wave 1 discovery", wave=1, agent_id="a", state_dir=state_dir)
         result = get_relay_context(state_dir, current_wave=2)
         assert "Wave 1 discovery" in result
+
+
+class TestRelayDedup:
+    def test_identical_briefs_are_deduped(self, tmp_path):
+        # write_brief() creates the briefs dir on its own; no manual mkdir needed.
+        brief_a = "## Agent: a | Feature: f1\n**Status:** complete\n**Files:** src/foo.go"
+        brief_b = brief_a  # byte-identical
+        brief_c = "## Agent: c | Feature: f2\n**Status:** complete\n**Files:** src/bar.go"
+
+        write_brief(brief_a, wave=1, agent_id="a", state_dir=tmp_path)
+        write_brief(brief_b, wave=1, agent_id="b", state_dir=tmp_path)
+        write_brief(brief_c, wave=1, agent_id="c", state_dir=tmp_path)
+
+        relay = get_relay_context(tmp_path, current_wave=1, include_current_wave=True)
+
+        assert relay.count("src/foo.go") == 1, "duplicate brief a/b should appear only once"
+        assert relay.count("src/bar.go") == 1
+        assert "Agent: a" in relay or "Agent: b" in relay  # at least one copy survives
+
+    def test_distinct_briefs_are_all_included(self, tmp_path):
+        write_brief("## Agent: a | Feature: f1\n**Files:** src/foo.go", 1, "a", tmp_path)
+        write_brief("## Agent: b | Feature: f2\n**Files:** src/bar.go", 1, "b", tmp_path)
+
+        relay = get_relay_context(tmp_path, current_wave=1, include_current_wave=True)
+        assert "src/foo.go" in relay
+        assert "src/bar.go" in relay

@@ -173,9 +173,26 @@ def get_relay_context(state_dir: Path, current_wave: int, include_current_wave: 
     if not same_wave and not prior_wave:
         return ""
 
+    import hashlib
+
     MAX_CHARS = 15000  # ~3750 tokens — keeps TASK_BRIEF.md manageable
-    parts = []
+    parts: list[str] = []
     total_size = 0
+    seen_hashes: set[str] = set()
+
+    def _try_add(content: str) -> bool:
+        """Add content if not a duplicate and within budget. Returns False when
+        the budget is exhausted so the caller can break out of its loop."""
+        nonlocal total_size
+        h = hashlib.sha1(content.encode("utf-8", errors="replace")).hexdigest()
+        if h in seen_hashes:
+            return True  # dup — skip but keep going
+        if total_size + len(content) > MAX_CHARS:
+            return False  # budget blown — caller should stop
+        seen_hashes.add(h)
+        parts.append(content)
+        total_size += len(content)
+        return True
 
     # Same-wave briefs first — most relevant (parallel siblings)
     if same_wave:
@@ -185,10 +202,8 @@ def get_relay_context(state_dir: Path, current_wave: int, include_current_wave: 
                 content = p.read_text()
             except OSError:
                 continue
-            if total_size + len(content) > MAX_CHARS:
+            if not _try_add(content):
                 break
-            parts.append(content)
-            total_size += len(content)
 
     # Prior-wave briefs — recent ones only
     if prior_wave and total_size < MAX_CHARS:
@@ -198,10 +213,8 @@ def get_relay_context(state_dir: Path, current_wave: int, include_current_wave: 
                 content = p.read_text()
             except OSError:
                 continue
-            if total_size + len(content) > MAX_CHARS:
+            if not _try_add(content):
                 break
-            parts.append(content)
-            total_size += len(content)
 
     body = "\n\n".join(parts)
     return (
