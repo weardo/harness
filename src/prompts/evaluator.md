@@ -77,7 +77,7 @@ Write detailed feedback to `{{STATE_DIR}}/feedback.md`:
 ```markdown
 ## Evaluation: Feature {{FEATURE_ID}} — {{DESCRIPTION}}
 
-### Verdict: FAIL (attempt {{RETRY_COUNT}} of {{MAX_RETRIES}})
+### Verdict: FAIL
 
 ### Failed Criteria:
 {{#EACH_FAILED}}
@@ -96,7 +96,7 @@ Write detailed feedback to `{{STATE_DIR}}/feedback.md`:
 And write to stdout:
 ```
 VERDICT: FAIL
-Feature {{FEATURE_ID}} — {{RETRY_COUNT}}/{{MAX_RETRIES}} attempts used
+Feature {{FEATURE_ID}} — FAIL
 Failures: {{NUMBER}} criteria failed
 Feedback written to {{STATE_DIR}}/feedback.md
 ```

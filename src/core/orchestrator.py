@@ -117,8 +117,14 @@ def _build_eval_replacements(
     """Build evaluator system prompt replacements and user message.
 
     Returns (system_replacements, preferred_file, fallback_file, user_message).
-    System replacements are wave-constant (cacheable).
-    User message contains feature-specific details (dynamic).
+    System replacements are feature-independent AND retry-independent so the
+    rendered system prompt is byte-stable across features and retries — this
+    lets the Claude prompt cache hit on every evaluator call within its TTL.
+
+    retry_count is accepted (for backward compatibility with call sites) but is
+    deliberately NOT written into the system prompt. It is appended to the user
+    message instead so the evaluator can still reason about retry context
+    without busting the cache.
     """
     feature_desc = feature_id
     ac_text = ""
@@ -135,24 +141,26 @@ def _build_eval_replacements(
                             elif ac:
                                 ac_text = ac
 
-    # System prompt replacements (mostly static, cacheable across features in a wave).
-    # NOTE: RETRY_COUNT varies per retry attempt, which defeats caching on retries.
-    # Acceptable trade-off: retries are rare and typically outside the 5-min cache TTL anyway.
+    # System prompt replacements — feature-independent AND retry-independent.
+    # Anything dynamic goes in the user message below so the system prompt caches.
     system_replacements = {
         "STATE_DIR": str(state_dir),
         "TEST_COMMAND": test_command,
         "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
-        "RETRY_COUNT": str(retry_count),
-        "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
     }
 
-    # User message (dynamic, per-feature)
+    # User message (dynamic, per-feature, per-retry)
     user_msg_parts = [
         f"Feature ID: {feature_id}",
         f"Description: {feature_desc}",
     ]
     if ac_text:
         user_msg_parts.append(f"\nAcceptance Criteria:\n{ac_text}")
+    if retry_count > 1:
+        max_retries = config.get("generator", {}).get("max_retries_per_feature", 3)
+        user_msg_parts.append(
+            f"\nRetry context: this is attempt {retry_count} of {max_retries}."
+        )
     user_message = "\n".join(user_msg_parts)
 
     return system_replacements, "evaluator-v2.md", "evaluator.md", user_message
@@ -689,8 +697,6 @@ async def run_parallel_wave(
         "STATE_DIR": str(state_dir),
         "TEST_COMMAND": test_command,
         "IF_WEB_PROJECT": config.get("evaluator", {}).get("browser_verification") != "never",
-        "RETRY_COUNT": "1",
-        "MAX_RETRIES": str(config.get("generator", {}).get("max_retries_per_feature", 3)),
     }
     _qa_file = "evaluator-v2.md" if (prompts_dir / "evaluator-v2.md").exists() else "evaluator.md"
     qa_system_prompt = load_prompt(prompts_dir / _qa_file, _qa_repl)

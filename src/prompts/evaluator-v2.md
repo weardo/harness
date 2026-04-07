@@ -68,7 +68,7 @@ Write detailed feedback to `./feedback.md` (current directory):
 ```markdown
 ## Evaluation: Feature <feature-id>
 
-### Verdict: FAIL (attempt {{RETRY_COUNT}} of {{MAX_RETRIES}})
+### Verdict: FAIL
 
 ### Failed Criteria:
 1. "criterion text"
@@ -80,7 +80,7 @@ Write detailed feedback to `./feedback.md` (current directory):
 And write to stdout:
 ```
 VERDICT: FAIL
-Feature <feature-id> — {{RETRY_COUNT}}/{{MAX_RETRIES}} attempts used
+Feature <feature-id> — FAIL
 ```
 
 ## GRADING
