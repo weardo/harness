@@ -275,9 +275,12 @@ class TestParallelWaveBasic:
                 session=env["session"],
             ))
 
-        # First feature should complete, second requeued due to overlap
+        # First feature should complete. Second gets deferred due to scope
+        # overlap, then retried after the first releases its claim — so it
+        # eventually lands in `completed`, not `conflicts`. The scope-overlap
+        # event itself is a transient signal, not a terminal outcome.
         assert "001" in result["completed"]
-        assert "002" in result["conflicts"]
+        assert "002" in result["completed"]
 
     def test_merge_conflict_requeues_feature(self, harness_env):
         """Merge conflict should requeue the conflicting feature."""
@@ -408,19 +411,23 @@ class TestDiscoveryRelay:
         env = harness_env
         layer = env["work_plan"].flatten_for_grouping()
 
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.merge_worktree") as mock_merge, \
-             patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
+        async def _mock_session(prompt, *args, **kwargs):
+            if "assigned feature" in prompt.lower() or "TASK_BRIEF" in prompt:
+                return {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01}
+            return {"output": MOCK_EVALUATOR_PASS, "cost": 0.005}
 
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            mock_merge.return_value = {"success": True, "conflict": False, "error": ""}
-            mock_session.side_effect = [
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-            ]
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-brief-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-brief-{_wt_counter[0]}")
+
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.merge_worktree", return_value={"success": True, "conflict": False, "error": ""}), \
+             patch("src.core.orchestrator.cleanup_worktree"), \
+             patch("src.core.orchestrator.branch_has_commits", return_value=True), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=_mock_session):
 
             run_async(run_parallel_wave(
                 layer=layer,
@@ -447,19 +454,23 @@ class TestDiscoveryRelay:
         env = harness_env
         layer = env["work_plan"].flatten_for_grouping()
 
-        with patch("src.core.orchestrator.create_worktree") as mock_wt, \
-             patch("src.core.orchestrator.merge_worktree") as mock_merge, \
-             patch("src.core.orchestrator.cleanup_worktree"), \
-             patch("src.core.orchestrator.run_agent_session") as mock_session:
+        async def _mock_session(prompt, *args, **kwargs):
+            if "assigned feature" in prompt.lower() or "TASK_BRIEF" in prompt:
+                return {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01}
+            return {"output": MOCK_EVALUATOR_PASS, "cost": 0.005}
 
-            mock_wt.return_value = (env["tmp_path"] / "wt", "branch-test")
-            mock_merge.return_value = {"success": True, "conflict": False, "error": ""}
-            mock_session.side_effect = [
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_GENERATOR_OUTPUT, "cost": 0.01},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-                {"output": MOCK_EVALUATOR_PASS, "cost": 0.005},
-            ]
+        _wt_counter = [0]
+        def _unique_wt(*args, **kwargs):
+            _wt_counter[0] += 1
+            wt = env["tmp_path"] / f"wt-coord-{_wt_counter[0]}"
+            wt.mkdir(exist_ok=True)
+            return (wt, f"branch-coord-{_wt_counter[0]}")
+
+        with patch("src.core.orchestrator.create_worktree", side_effect=_unique_wt), \
+             patch("src.core.orchestrator.merge_worktree", return_value={"success": True, "conflict": False, "error": ""}), \
+             patch("src.core.orchestrator.cleanup_worktree"), \
+             patch("src.core.orchestrator.branch_has_commits", return_value=True), \
+             patch("src.core.orchestrator.run_agent_session", side_effect=_mock_session):
 
             run_async(run_parallel_wave(
                 layer=layer,

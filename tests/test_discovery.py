@@ -290,6 +290,9 @@ class TestGetRelayContext:
         assert "=== END DISCOVERY RELAY ===" in result
 
     def test_multiple_waves_sorted(self, tmp_path):
+        # Prior-wave briefs are now ordered highest-wave-first (most recent),
+        # so Wave 2 appears BEFORE Wave 1 — newer discoveries are more
+        # relevant to the current agent's context.
         state_dir = tmp_path / "h5" / "state"
         state_dir.mkdir(parents=True)
         write_brief("Wave 2 brief", wave=2, agent_id="a", state_dir=state_dir)
@@ -297,7 +300,7 @@ class TestGetRelayContext:
         result = get_relay_context(state_dir, current_wave=3)
         pos_w1 = result.index("Wave 1 brief")
         pos_w2 = result.index("Wave 2 brief")
-        assert pos_w1 < pos_w2
+        assert pos_w2 < pos_w1
 
     def test_excludes_current_and_future_waves(self, tmp_path):
         state_dir = tmp_path / "h6" / "state"
