@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Harness Product Prototype</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <a href="#requests" class="brand">Harness</a>
+        <p class="tagline">Prototype control surface for requests, context, and runs.</p>
+      </div>
+
+      <nav class="nav">
+        <a href="#requests" data-route="requests">Product Requests</a>
+        <a href="#runs" data-route="runs">Runs</a>
+      </nav>
+
+      <section class="panel quick-panel">
+        <div class="panel-label">Loop</div>
+        <ol class="quick-loop">
+          <li>Capture a request</li>
+          <li>Inspect assembled context</li>
+          <li>Launch Harness</li>
+          <li>Review runs and events</li>
+        </ol>
+      </section>
+    </aside>
+
+    <main class="main">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Early Product Layer</p>
+          <h1>Request to execution, visible in one place.</h1>
+        </div>
+        <div class="hero-meta" id="hero-meta">
+          <div class="metric-card">
+            <span class="metric-label">Project</span>
+            <strong id="project-name">Loading…</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">API</span>
+            <strong id="api-base">/api</strong>
+          </div>
+        </div>
+      </header>
+
+      <section id="app" class="app-view">
+        <div class="empty-state">
+          <h2>Loading prototype…</h2>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
