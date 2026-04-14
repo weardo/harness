@@ -19,7 +19,7 @@ from pathlib import Path
 # Add parent to path so we can import core modules
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.orchestrator import run_harness
+from product.services.run_service import RunService
 
 
 def _copy_retrospective_template(project_dir: str, project_name: str, features_total: int, features_done: int, duration_str: str = "unknown"):
@@ -100,6 +100,7 @@ Examples:
 
 def main():
     args = parse_args()
+    run_service = RunService()
 
     # Validate input
     if not args.resume and not args.prompt and not args.spec and not args.plan:
@@ -160,22 +161,25 @@ def main():
 
     # Run
     try:
-        result = asyncio.run(run_harness(
-            config_path=config_path,
-            project_dir=project_dir,
-            prompt=args.prompt,
-            spec_path=args.spec,
-            plan_path=args.plan,
-            resume=args.resume,
-            cli_overrides=overrides if overrides else None,
-        ))
+        result = asyncio.run(
+            run_service.run(
+                config_path=config_path,
+                project_dir=project_dir,
+                prompt=args.prompt,
+                spec_path=args.spec,
+                plan_path=args.plan,
+                resume=args.resume,
+                cli_overrides=overrides if overrides else None,
+            )
+        )
+        raw_result = result.get("raw_result", {})
 
         _copy_retrospective_template(
             str(project_dir),
             project_dir.name,
-            result["features"]["total"],
-            result["features"]["passing"],
-            f"{result['duration_minutes']}m",
+            raw_result.get("features", {}).get("total", 0),
+            raw_result.get("features", {}).get("passing", 0),
+            f"{raw_result.get('duration_minutes', 0)}m",
         )
 
         # Exit 0: harness ran successfully (complete or hit a configured limit)

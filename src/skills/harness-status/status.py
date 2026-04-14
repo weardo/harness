@@ -265,14 +265,23 @@ def get_worktrees(project: Path, run_dir: Path, agents: list[dict]) -> list[dict
         a = assign_map.get(worker_name, {})
         feature_id = a.get("feature_id", "?")
         a_status = a.get("status", "unknown")
+        a_live = a.get("live_state", "")
 
-        # Classify
+        # Classify — status field is the authoritative state machine value.
+        # merge_failed is distinct from failed (eval-fail) so each routes differently
+        # in the recovery path.
         has_agent = path.rstrip("/") in agent_cwds
         if has_agent:
             status = "active"
+        elif commits > 0 and a_status == "merge_failed":
+            status = "merge-failed"
         elif commits > 0 and a_status == "failed" and orch:
-            status = "eval-failed"
-        elif commits > 0 and a_status == "failed" and not orch:
+            # live_state may indicate eval-done (eval passed but merge pending)
+            if a_live == "eval-done":
+                status = "pending-merge"
+            else:
+                status = "eval-failed"
+        elif commits > 0 and a_status in ("failed", "merge_failed") and not orch:
             status = "pending-recovery"
         elif commits > 0 and a_status in ("completed",):
             status = "completed"
@@ -320,13 +329,15 @@ def get_worker_assignments(run_dir: Path) -> list[dict]:
     assignments = data.get("assignments", {})
     results = []
     now = datetime.now(timezone.utc)
+    from datetime import datetime as dt
     for worker_id, a in assignments.items():
-        assigned_at = a.get("assigned_at", "")
+        # Prefer live_state_at (updated on every transition) over assigned_at
+        # (set once at worker creation, often hours stale on long-running workers).
+        ts_field = a.get("live_state_at") or a.get("assigned_at", "")
         duration = ""
-        if assigned_at:
+        if ts_field:
             try:
-                from datetime import datetime as dt
-                t = dt.fromisoformat(assigned_at)
+                t = dt.fromisoformat(ts_field)
                 delta = now - t
                 mins = int(delta.total_seconds() / 60)
                 secs = int(delta.total_seconds() % 60)
@@ -338,6 +349,9 @@ def get_worker_assignments(run_dir: Path) -> list[dict]:
             "feature_id": a.get("feature_id", "?"),
             "status": a.get("status", "?"),
             "phase": a.get("phase", "generator"),
+            # live_state is the real-time state (gen-running, eval-done, merging, ...)
+            # phase is the orchestrator's "intent" — what role was last dispatched
+            "live_state": a.get("live_state", ""),
             "scope": a.get("scope", []),
             "duration": duration,
             "agent_id": a.get("agent_id", "?"),
@@ -453,16 +467,53 @@ def pretty_print(data: dict):
         print()
 
     # ── Active Workers ───────────────────────────────────
+    # A worker is "active" if its live_state indicates an in-flight phase.
+    # Don't filter on `status` alone — `status="failed"` can coexist with an
+    # actively-running agent when the orchestrator is retrying (e.g., after
+    # a merge failure the status is "failed" but a fresh evaluator is running).
+    ACTIVE_LIVE_STATES = {
+        "assigned", "gen-running", "gen-done",
+        "eval-running", "eval-done", "merging",
+    }
     workers = sorted(data.get("worker_assignments", []), key=lambda w: w.get("worker", ""))
-    running = [w for w in workers if w["status"] == "running"]
+    running = [
+        w for w in workers
+        if w.get("live_state") in ACTIVE_LIVE_STATES
+        or (not w.get("live_state") and w.get("status") == "running")
+    ]
     if running:
         print(f"Active Workers: {len(running)}")
         for w in running:
-            phase_tag = "GEN" if w.get("phase", "generator") == "generator" else "EVAL"
+            # Prefer real-time live_state when available; fall back to phase
+            live = w.get("live_state", "")
+            if live:
+                # Compact display: gen-running → GEN, eval-running → EVAL,
+                # gen-done → GEN✓, eval-done → EVAL✓, merging → MERGE, etc.
+                tag_map = {
+                    "assigned": "INIT",
+                    # Generator lifecycle
+                    "gen-running": "GEN ", "gen-done": "GEN✓",
+                    "gen-timeout": "GEN!",
+                    "gen-failed-with-commits": "GFAIL",
+                    "gen-failed-no-commits": "GNULL",
+                    # Evaluator lifecycle
+                    "eval-running": "EVAL ", "eval-done": "EVAL✓",
+                    "eval-timeout": "EVAL!",
+                    # Eval failure variants — distinct remediation strategies
+                    "eval-failed-retrying": "RETRY",   # has budget, retrying same worktree
+                    "eval-failed-blocked": "BLOCK",    # exhausted retries
+                    "eval-failed-recovering": "RECOV", # dispatched a recovery generator
+                    # Merge lifecycle
+                    "merging": "MERGE", "merge-success": "MRG✓",
+                    "merge-conflict": "CONF", "merge-failed": "MRG✗",
+                }
+                phase_tag = tag_map.get(live, live[:5].upper())
+            else:
+                phase_tag = "GEN" if w.get("phase", "generator") == "generator" else "EVAL"
             scope_str = ", ".join(s.split("/")[-2] + "/" if s.endswith("/") else s.split("/")[-1] for s in w["scope"][:3])
             if len(w["scope"]) > 3:
                 scope_str += f" +{len(w['scope'])-3}"
-            print(f"  {w['worker']:14s} {w['feature_id']:10s} {phase_tag:4s} {w['duration']:>8s}  [{scope_str}]")
+            print(f"  {w['worker']:14s} {w['feature_id']:10s} {phase_tag:5s} {w['duration']:>8s}  [{scope_str}]")
     else:
         print("Active Workers: none")
 
@@ -519,8 +570,9 @@ def pretty_print(data: dict):
         # Build worker->phase lookup from assignments
         phase_map = {w["worker"]: w.get("phase", "generator") for w in workers}
         print("Worktrees:")
-        icons = {"active": ">", "eval-failed": "x", "pending-recovery": "?",
-                 "pending-merge": "~", "completed": "+", "empty": "."}
+        icons = {"active": ">", "eval-failed": "x", "merge-failed": "M",
+                 "pending-recovery": "?", "pending-merge": "~",
+                 "completed": "+", "empty": "."}
         for w in wts:
             icon = icons.get(w["status"], "?")
             msg = f"{w['commits']}c" if w["commits"] else "0c"
@@ -609,41 +661,38 @@ def main():
     project = Path(args.project) if args.project else find_project_root()
 
     if args.watch:
-        # Continuous mode — render to buffer, then swap in one write (no flicker)
-        import io, shutil
+        # Continuous mode — uses the alternate screen buffer (like top/htop/vim/less).
+        # This swaps to a fresh "page" while running and restores the user's terminal
+        # content on exit. No scrollback pollution, no flicker, no leftover-line tracking.
+        import io
         try:
-            # Clear screen once on first draw
-            sys.stdout.write("\033[2J\033[H")
+            # Enter alternate screen buffer + hide cursor
+            sys.stdout.write("\033[?1049h\033[?25l")
             sys.stdout.flush()
-            prev_lines = 0
             while True:
-                # Render to string buffer
+                # Render to buffer first so the clear+write happens in one flush
+                # (avoids visible flicker on slow renders).
                 buf = io.StringIO()
                 _old_stdout = sys.stdout
                 sys.stdout = buf
-                cols = shutil.get_terminal_size().columns
                 print(f"[watch — every {args.interval}s, Ctrl+C to stop]  "
                       f"{datetime.now().strftime('%H:%M:%S')}\n")
                 is_running = _gather_and_display(project, args.run, pretty=True)
                 if not is_running:
                     print("\nOrchestrator not running. Watching for restart...")
                 sys.stdout = _old_stdout
-                output = buf.getvalue()
 
-                # Move cursor to top, write output, clear leftover lines
-                lines = output.split("\n")
-                sys.stdout.write("\033[H")  # cursor to top-left
-                for line in lines:
-                    # Pad with spaces to overwrite previous longer lines
-                    sys.stdout.write(f"{line:<{cols}}\n")
-                # Clear any leftover lines from previous render
-                for _ in range(max(0, prev_lines - len(lines))):
-                    sys.stdout.write(f"\033[2K\n")  # clear line
-                sys.stdout.flush()
-                prev_lines = len(lines)
+                # Clear screen + home cursor + write full content in one write call
+                _old_stdout.write("\033[2J\033[H" + buf.getvalue())
+                _old_stdout.flush()
                 time.sleep(args.interval)
         except KeyboardInterrupt:
-            print("\n\nWatch stopped.")
+            pass
+        finally:
+            # Restore cursor + leave alternate screen (returns user to their original terminal)
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+            print("Watch stopped.")
     else:
         result = _gather_and_display(project, args.run, pretty=args.pretty)
         if not result and not args.pretty:

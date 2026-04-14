@@ -298,6 +298,78 @@ class TestSweepMergedWorktrees:
         remaining_paths = [str(e["path"]) for e in remaining]
         assert not any(str(ghost) in p for p in remaining_paths)
 
+    def test_sweep_skips_dirty_worktree_by_default(self, tmp_path):
+        """Without state_dir, dirty worktrees are protected from removal."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_repo(repo)
+
+        wt = tmp_path / "wt-dirty"
+        _git(["worktree", "add", str(wt), "-b", "dirty-branch"], repo)
+        # Make uncommitted changes
+        (wt / "uncommitted.txt").write_text("dirty work")
+        _git(["add", "uncommitted.txt"], wt)  # staged but not committed
+
+        removed = sweep_merged_worktrees(repo)
+        assert str(wt) not in removed
+        assert wt.exists(), "dirty worktree must be preserved without state_dir"
+
+    def test_sweep_removes_orphan_dirty_worktree_with_state_dir(self, tmp_path):
+        """With state_dir, dirty worktrees with no assignment are removed."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_repo(repo)
+
+        # Create a state_dir with empty assignments
+        state_dir = tmp_path / "state"
+        (state_dir / "fleet").mkdir(parents=True)
+        (state_dir / "fleet" / "worker_assignments.json").write_text(
+            '{"assignments": {}}'
+        )
+
+        wt = tmp_path / "wt-orphan"
+        _git(["worktree", "add", str(wt), "-b", "orphan-branch"], repo)
+        # Make uncommitted changes (orphan from killed orchestrator)
+        (wt / "uncommitted.txt").write_text("orphan work")
+        _git(["add", "uncommitted.txt"], wt)
+
+        removed = sweep_merged_worktrees(repo, state_dir=state_dir)
+        # Orphan dirty worktree must be removed
+        assert any(str(wt) in p for p in removed)
+        assert not wt.exists(), "orphan dirty worktree must be cleaned up"
+
+    def test_sweep_protects_dirty_worktree_with_assignment(self, tmp_path):
+        """With state_dir, dirty worktrees that ARE in assignments must still be protected."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_repo(repo)
+
+        wt = tmp_path / "wt-active"
+        _git(["worktree", "add", str(wt), "-b", "active-branch"], repo)
+        (wt / "uncommitted.txt").write_text("real work in progress")
+        _git(["add", "uncommitted.txt"], wt)
+
+        # State_dir says this worker has an active assignment
+        state_dir = tmp_path / "state"
+        (state_dir / "fleet").mkdir(parents=True)
+        import json
+        (state_dir / "fleet" / "worker_assignments.json").write_text(json.dumps({
+            "assignments": {
+                "worker-active": {
+                    "feature_id": "task-X",
+                    "worktree_dir": str(wt.resolve()),
+                    "branch": "active-branch",
+                    "status": "running",
+                    "phase": "generator",
+                }
+            }
+        }))
+
+        removed = sweep_merged_worktrees(repo, state_dir=state_dir)
+        # Worktree with assignment must NOT be removed even if dirty
+        assert not any(str(wt) in p for p in removed)
+        assert wt.exists(), "active worker's worktree must be preserved"
+
 
 # ---------------------------------------------------------------------------
 # Feature 010 — TestShouldUseWorktree

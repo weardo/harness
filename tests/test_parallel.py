@@ -130,6 +130,30 @@ class TestWorktreeOperations:
         cleanup_worktree(tmp_git_repo, wt_dir, branch)
         assert not wt_dir.exists()
 
+    def test_create_worktree_recovers_from_stale_branch(self, tmp_git_repo):
+        subprocess.run(
+            ["git", "branch", "harness/worker-0"],
+            cwd=tmp_git_repo,
+            capture_output=True,
+            check=True,
+        )
+
+        wt_dir, branch = create_worktree(tmp_git_repo, 0)
+
+        assert wt_dir.exists()
+        assert branch == "harness/worker-0"
+
+        result = subprocess.run(
+            ["git", "branch", "--list", branch],
+            cwd=tmp_git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert branch in result.stdout
+
+        cleanup_worktree(tmp_git_repo, wt_dir, branch)
+
     def test_merge_no_conflict(self, tmp_git_repo):
         wt_dir, branch = create_worktree(tmp_git_repo, 0)
 

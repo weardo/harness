@@ -43,6 +43,7 @@ def add_assignment(
 ) -> None:
     """Record a worker assignment. Called before agent launch."""
     data = load_assignments(state_dir)
+    now = datetime.now(timezone.utc).isoformat()
     data["assignments"][worker_id] = {
         "feature_id": feature_id,
         "branch": branch,
@@ -50,11 +51,13 @@ def add_assignment(
         "agent_id": agent_id,
         "wave": wave,
         "scope": scope,
-        "assigned_at": datetime.now(timezone.utc).isoformat(),
+        "assigned_at": now,
         "status": "running",
         "phase": "generator",
         "gen_session_id": "",
         "eval_session_id": "",
+        "live_state": "assigned",
+        "live_state_at": now,
     }
     save_assignments(data, state_dir)
 
@@ -83,6 +86,28 @@ def update_assignment_phase(
     data = load_assignments(state_dir)
     if worker_id in data["assignments"]:
         data["assignments"][worker_id]["phase"] = phase
+        save_assignments(data, state_dir)
+
+
+def update_assignment_live_state(
+    state_dir: Path, worker_id: str, live_state: str
+) -> None:
+    """Update the worker's real-time live_state and timestamp.
+
+    Unlike `status` and `phase` (which feed into recovery semantics), this
+    field is purely observational. The orchestrator updates it at every
+    transition (gen-running → gen-done → eval-running → eval-done → merging
+    → ...) so observers like status.py can show what's actually happening
+    without waiting for the next iteration boundary.
+
+    Recovery logic ignores this field.
+    """
+    data = load_assignments(state_dir)
+    if worker_id in data["assignments"]:
+        data["assignments"][worker_id]["live_state"] = live_state
+        data["assignments"][worker_id]["live_state_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
         save_assignments(data, state_dir)
 
 
@@ -128,16 +153,18 @@ def mark_all_running_as_interrupted(state_dir: Path) -> list[str]:
 def get_resumable_assignments(state_dir: Path) -> dict[str, dict]:
     """Return assignments that can be resumed.
 
-    Includes 'running', 'interrupted', and 'failed' — failed assignments
-    may have commits worth merging (agent lost status block due to context
-    exhaustion). The orchestrator's resume logic checks branch_has_commits
-    to decide whether to merge or discard.
+    Includes 'running', 'interrupted', 'failed', and 'merge_failed':
+    - running/interrupted: orchestrator killed mid-work
+    - failed: eval failed with commits, worth retrying generator
+    - merge_failed: eval passed but merge hit conflicts; needs merge-retry,
+      not another full eval cycle (see resume_interrupted_workers for the
+      merge-only retry path)
     """
     data = load_assignments(state_dir)
     return {
         worker_id: assignment
         for worker_id, assignment in data["assignments"].items()
-        if assignment["status"] in ("running", "interrupted", "failed")
+        if assignment["status"] in ("running", "interrupted", "failed", "merge_failed")
     }
 
 

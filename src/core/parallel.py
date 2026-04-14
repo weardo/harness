@@ -11,6 +11,7 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 
 def group_by_dependency(features: list) -> list[list[dict]]:
@@ -252,6 +253,17 @@ def create_worktree(project_dir: Path, worker_id: int, base_branch: str = "HEAD"
     if worktree_dir.exists():
         cleanup_worktree(project_dir, worktree_dir, branch_name)
 
+    if _branch_exists(project_dir, branch_name):
+        if branch_has_commits(project_dir, branch_name):
+            branch_name = _unique_worker_branch_name(project_dir, worker_id)
+        else:
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+            )
+
     # Create worktree
     subprocess.run(
         ["git", "worktree", "add", str(worktree_dir), "-b", branch_name],
@@ -277,6 +289,24 @@ def create_worktree(project_dir: Path, worker_id: int, base_branch: str = "HEAD"
     _link_local_sdk(project_dir, worktree_dir)
 
     return worktree_dir, branch_name
+
+
+def _branch_exists(project_dir: Path, branch_name: str) -> bool:
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _unique_worker_branch_name(project_dir: Path, worker_id: int) -> str:
+    base_name = f"harness/worker-{worker_id}"
+    while True:
+        candidate = f"{base_name}-{uuid4().hex[:8]}"
+        if not _branch_exists(project_dir, candidate):
+            return candidate
 
 
 def _copy_env_files(project_dir: Path, worktree_dir: Path) -> None:

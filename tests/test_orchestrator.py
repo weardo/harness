@@ -12,8 +12,10 @@ import pytest
 from src.core.orchestrator import (
     load_prompt,
     process_conditionals,
+    _apply_execution_recipe_config,
     build_planner_prompt,
     validate_planner_output,
+    ensure_claude_auth,
     ensure_browser_tools,
     check_evaluator_used_browser,
     _perform_sweep,
@@ -268,6 +270,58 @@ class TestEnsureBrowserTools:
         with patch("subprocess.run", return_value=mock_result) as mock_run:
             ensure_browser_tools(tmp_dir, config)
             assert mock_run.call_count == 1
+
+
+class TestExecutionRecipeConfig:
+    def test_scoped_recipe_disables_browser_verification(self):
+        config = {
+            "evaluator": {
+                "browser_verification": "auto",
+                "browser_tool": "playwright",
+            }
+        }
+        recipe = {"evaluation_policy": "scoped_tests"}
+
+        adjusted = _apply_execution_recipe_config(config, recipe)
+
+        assert adjusted["evaluator"]["browser_verification"] == "never"
+        assert config["evaluator"]["browser_verification"] == "auto"
+
+    def test_full_suite_recipe_preserves_browser_verification(self):
+        config = {
+            "evaluator": {
+                "browser_verification": "auto",
+                "browser_tool": "playwright",
+            }
+        }
+        recipe = {"evaluation_policy": "full_suite"}
+
+        adjusted = _apply_execution_recipe_config(config, recipe)
+
+        assert adjusted["evaluator"]["browser_verification"] == "auto"
+
+
+class TestEnsureClaudeAuth:
+    def test_returns_api_key_when_env_present(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        assert ensure_claude_auth() == "api_key"
+
+    def test_returns_cli_logged_in_when_status_reports_logged_in(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_result = MagicMock()
+        mock_result.stdout = '{"loggedIn": true, "authMethod": "oauth"}'
+
+        with patch("subprocess.run", return_value=mock_result):
+            assert ensure_claude_auth() == "cli_logged_in"
+
+    def test_raises_clear_error_when_not_logged_in(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        mock_result = MagicMock()
+        mock_result.stdout = '{"loggedIn": false, "authMethod": "none"}'
+
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="not logged in"):
+                ensure_claude_auth()
 
 
 class TestFeatureDescInEvents:
@@ -703,6 +757,7 @@ class TestPipelineIntegration:
 
         with patch("src.core.orchestrator.run_planner_pipeline", wraps=mock_pipeline) as mock_pp, \
              patch("src.core.orchestrator.run_agent_session", side_effect=mock_session), \
+             patch("src.core.orchestrator.ensure_claude_auth", return_value="api_key"), \
              patch("src.core.orchestrator.ensure_browser_tools", return_value="skipped"), \
              patch("src.core.orchestrator.sweep_merged_worktrees", return_value=[]):
             try:
@@ -754,6 +809,7 @@ class TestPipelineIntegration:
 
         with patch("src.core.orchestrator.build_planner_prompt", side_effect=mock_bpp), \
              patch("src.core.orchestrator.run_agent_session", side_effect=mock_session), \
+             patch("src.core.orchestrator.ensure_claude_auth", return_value="api_key"), \
              patch("src.core.orchestrator.ensure_browser_tools", return_value="skipped"), \
              patch("src.core.orchestrator.sweep_merged_worktrees", return_value=[]):
             try:
@@ -955,6 +1011,8 @@ class TestRunAgentSessionCli:
                 result = await run_agent_session_cli("test", tmp_dir)
                 assert result["status"] == "error"
                 assert "timed out" in result["output"]
+                assert "timed out" in result["error"]
+                assert "timed out" in result["error_reason"]
                 proc.kill.assert_called_once()
 
         asyncio.run(run())
@@ -970,7 +1028,30 @@ class TestRunAgentSessionCli:
 
                 result = await run_agent_session_cli("test", tmp_dir)
                 assert result["status"] == "error"
+                assert result["error"] == "exit code 1"
                 assert "exit code 1" in result["error_reason"]
+
+        asyncio.run(run())
+
+    def test_cli_session_surfaces_result_error_text(self, tmp_dir):
+        """Claude CLI result errors should preserve the actual result text."""
+        async def run():
+            with patch("src.core.orchestrator.asyncio.create_subprocess_exec") as mock_exec:
+                proc = AsyncMock()
+                proc.communicate = AsyncMock(
+                    return_value=(
+                        b'{"type":"result","subtype":"success","is_error":true,"result":"Not logged in \\u00b7 Please run /login","duration_ms":12,"duration_api_ms":0,"num_turns":1}\n',
+                        b"",
+                    )
+                )
+                proc.returncode = 1
+                mock_exec.return_value = proc
+
+                result = await run_agent_session_cli("test", tmp_dir)
+                assert result["status"] == "error"
+                assert result["error"] == "Not logged in \u00b7 Please run /login"
+                assert result["error_reason"] == "Not logged in \u00b7 Please run /login"
+                assert "Not logged in" in result["output"]
 
         asyncio.run(run())
 

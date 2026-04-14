@@ -10,7 +10,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from .state import StateManager, RunRegistry
+from .state import StateManager
+from .run_registry import RunRegistry
 
 
 def check_completion(harness_dir: Path, test_command: Optional[str] = None, state_dir: Optional[Path] = None) -> dict:

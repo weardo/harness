@@ -67,7 +67,11 @@ def list_worktrees(repo_dir) -> list[dict]:
     return worktrees
 
 
-def sweep_merged_worktrees(repo_dir, dry_run: bool = False) -> list[str]:
+def sweep_merged_worktrees(
+    repo_dir,
+    dry_run: bool = False,
+    state_dir: Optional[Path] = None,
+) -> list[str]:
     """Remove linked worktrees whose HEAD has been merged into the main worktree.
 
     - Never removes the main worktree (is_main=True).
@@ -78,9 +82,28 @@ def sweep_merged_worktrees(repo_dir, dry_run: bool = False) -> list[str]:
     - Calls ``git worktree prune`` at the end (always, including dry_run).
     - dry_run=True returns paths that *would* be removed without touching anything.
 
+    By default, dirty worktrees (uncommitted changes) are SKIPPED to protect
+    in-progress agent work. If ``state_dir`` is provided, dirty worktrees that
+    have **no entry in worker_assignments.json** are treated as orphans and
+    removed regardless of dirty status — those changes are leftover from a
+    killed orchestrator, not in-progress work that anyone will resume.
+
     Returns a list of removed worktree path strings.
     """
     repo_dir = Path(repo_dir).resolve()
+
+    # Load assignment lookup if state_dir provided so we can detect orphans
+    _assigned_worktrees: set[str] = set()
+    if state_dir is not None:
+        try:
+            from . import worker_assignments as _wa
+            _data = _wa.load_assignments(Path(state_dir))
+            for _wid, _a in _data.get("assignments", {}).items():
+                wt = _a.get("worktree_dir", "")
+                if wt:
+                    _assigned_worktrees.add(str(Path(wt).resolve()))
+        except Exception:
+            pass  # Best-effort — fall back to dirty-protection
 
     # Resolve the main worktree's HEAD — the merge target
     head_result = subprocess.run(
@@ -103,10 +126,17 @@ def sweep_merged_worktrees(repo_dir, dry_run: bool = False) -> list[str]:
         if is_ancestor_of(repo_dir, wt["commit"], target=main_head):
             path_str = str(wt["path"])
 
-            # NEVER remove a worktree that has uncommitted changes — a generator
-            # may be actively writing files but hasn't committed yet.
+            # By default protect worktrees with uncommitted changes — a generator
+            # may be actively writing files but hasn't committed yet. Exception:
+            # if state_dir is provided AND this worktree has no assignment entry,
+            # the dirty changes are orphans (left by a killed orchestrator) and
+            # safe to delete.
             wt_path = Path(path_str)
-            if wt_path.exists():
+            _is_orphan = (
+                state_dir is not None
+                and str(wt_path.resolve()) not in _assigned_worktrees
+            )
+            if wt_path.exists() and not _is_orphan:
                 _dirty = subprocess.run(
                     ["git", "status", "--porcelain"],
                     cwd=str(wt_path),

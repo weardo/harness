@@ -9,11 +9,13 @@ cost tracking, progress detection, and resume support.
 import asyncio
 import json as json_mod
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .state import StateManager, RunRegistry
+from .state import StateManager
+from .run_registry import RunRegistry
 from .circuit_breaker import CircuitBreaker, hash_error
 from .completion import check_completion, check_exit_conditions, check_suspicion
 from .cost_tracker import CostTracker
@@ -284,6 +286,75 @@ RATE_LIMIT_WAIT_SECONDS = 300  # 5 minutes between rate limit retries
 RATE_LIMIT_MAX_RETRIES = 3
 
 
+def _session_error(result: dict) -> str:
+    """Return the best available error string from a session result."""
+    return str(
+        result.get("error")
+        or result.get("error_reason")
+        or "unknown"
+    )
+
+
+def _apply_execution_recipe_config(config: dict, execution_recipe: dict) -> dict:
+    """Adjust config for recipe-specific execution needs.
+
+    Small brownfield/scoped runs should not pay the cost of browser MCP setup
+    or browser-tool injection unless the selected evaluation policy actually
+    expects a browser-backed full suite.
+    """
+    recipe = execution_recipe or {}
+    evaluation_policy = recipe.get("evaluation_policy", "full_suite")
+    if evaluation_policy == "full_suite":
+        return config
+
+    adjusted = deepcopy(config)
+    evaluator = dict(adjusted.get("evaluator", {}) or {})
+    evaluator["browser_verification"] = "never"
+    adjusted["evaluator"] = evaluator
+    return adjusted
+
+
+def ensure_claude_auth() -> str:
+    """Ensure the Claude runtime is authenticated before starting a run.
+
+    If an API key is present, the SDK/CLI can use that directly. Otherwise we
+    require an authenticated Claude Code CLI session and fail fast with a clear
+    remediation message instead of discovering this mid-generator.
+    """
+    import os
+    import subprocess
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "api_key"
+
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Claude auth preflight failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    payload = {}
+    stdout = (result.stdout or "").strip()
+    if stdout:
+        try:
+            payload = json_mod.loads(stdout)
+        except json_mod.JSONDecodeError:
+            payload = {}
+
+    if payload.get("loggedIn") is True:
+        return "cli_logged_in"
+
+    raise RuntimeError(
+        "Claude CLI is not logged in. Run `claude auth login` or set ANTHROPIC_API_KEY."
+    )
+
+
 async def run_agent_session(
     prompt: str,
     options: dict,
@@ -508,6 +579,7 @@ async def run_agent_session_cli(
     """
     options = options or {}
     model = options.get("model", "claude-sonnet-4-6")
+    settings_path = options.get("settings")
 
     if resume_session_id:
         # Resume existing session — agent retains full conversation history.
@@ -527,6 +599,8 @@ async def run_agent_session_cli(
         ]
         if system_prompt:
             cmd += ["--system-prompt", system_prompt]
+    if settings_path:
+        cmd += ["--settings", str(settings_path)]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -544,15 +618,18 @@ async def run_agent_session_cli(
         proc.kill()
         await proc.wait()
         _active_worker_procs.discard(proc)
+        error_reason = "CLI session timed out after 3600s"
         return {
             "status": "error",
-            "output": "[CLI session timed out after 3600s]",
+            "output": f"[{error_reason}]",
             "cost": 0.0,
             "usage": {},
             "session_id": None,
             "duration_ms": 0,
             "duration_api_ms": 0,
             "num_turns": 0,
+            "error": error_reason,
+            "error_reason": error_reason,
         }
     finally:
         _active_worker_procs.discard(proc)
@@ -568,6 +645,8 @@ async def run_agent_session_cli(
     duration_ms = 0
     duration_api_ms = 0
     num_turns = 0
+    result_error_text = ""
+    result_is_error = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -594,8 +673,12 @@ async def run_agent_session_cli(
             duration_ms = msg.get("duration_ms", 0) or 0
             duration_api_ms = msg.get("duration_api_ms", 0) or 0
             num_turns = msg.get("num_turns", 0) or 0
+            result_is_error = bool(msg.get("is_error"))
             if msg.get("result"):
-                output_parts.append(msg["result"])
+                result_text = str(msg["result"])
+                output_parts.append(result_text)
+                if result_is_error:
+                    result_error_text = result_text
 
     output = "\n".join(output_parts)
     if stderr:
@@ -610,6 +693,11 @@ async def run_agent_session_cli(
         _is_rate_limit = ("hit your limit" in _lower
                           or "rate_limit" in _lower
                           or ("resets " in _lower and "limit" in _lower))
+        error_reason = (
+            "rate_limited"
+            if _is_rate_limit
+            else result_error_text or f"exit code {proc.returncode}"
+        )
         return {
             "status": "rate_limited" if _is_rate_limit else "error",
             "output": output,
@@ -619,7 +707,23 @@ async def run_agent_session_cli(
             "duration_ms": duration_ms,
             "duration_api_ms": duration_api_ms,
             "num_turns": num_turns,
-            "error_reason": "rate_limited" if _is_rate_limit else f"exit code {proc.returncode}",
+            "error": error_reason,
+            "error_reason": error_reason,
+        }
+
+    if result_is_error:
+        error_reason = result_error_text or "CLI result reported an error"
+        return {
+            "status": "error",
+            "output": output,
+            "cost": cost_usd,
+            "usage": usage,
+            "session_id": session_id,
+            "duration_ms": duration_ms,
+            "duration_api_ms": duration_api_ms,
+            "num_turns": num_turns,
+            "error": error_reason,
+            "error_reason": error_reason,
         }
 
     return {
@@ -1734,6 +1838,7 @@ async def run_harness(
     resume: bool = False,
     run_id: Optional[str] = None,
     cli_overrides: Optional[dict] = None,
+    execution_request: Optional[dict] = None,
 ) -> dict:
     """Main harness entry point.
 
@@ -1833,6 +1938,18 @@ async def run_harness(
           f"iterations={config.get('max_iterations', 'unlimited')}")
     print()
 
+    # Determine execution recipe early so setup/preflight can respect it.
+    execution_recipe = (execution_request or {}).get("execution_recipe", {}) or {}
+    recipe_id = execution_recipe.get("recipe_id", "greenfield-full-v1")
+    config = _apply_execution_recipe_config(config, execution_recipe)
+
+    try:
+        auth_mode = ensure_claude_auth()
+        _write_run_log(state_dir, "auth_preflight", mode=auth_mode)
+    except Exception as exc:
+        print(f"  Auth preflight warning: {exc}")
+        _write_run_log(state_dir, "auth_preflight_warning", error=str(exc))
+
     # Sweep merged worktrees at run start (feature 040)
     # Pass state_dir so the sweep can identify orphan worktrees (no assignment)
     # and clean them even if they have uncommitted changes from a killed orchestrator.
@@ -1861,7 +1978,10 @@ async def run_harness(
     strategies = config.get("strategies", {})
     # Only use multi-role pipeline in full-plan mode
     use_pipeline = bool(
-        delegation_mode == "full-plan"
+        recipe_id == "greenfield-full-v1"
+        and execution_recipe.get("planning_policy", "full") == "full"
+        and execution_recipe.get("task_source", "work_plan") == "work_plan"
+        and delegation_mode == "full-plan"
         and default_strategy
         and strategies.get(default_strategy)
     )
@@ -1869,105 +1989,122 @@ async def run_harness(
     # === PHASE 1: PLANNER ===
     # Run planner if not complete — resume skips completed roles internally via planner_roles state
     if not state.get("planner_complete"):
-        print(f"--- PHASE 1: PLANNER (delegation: {delegation_mode}){' (resuming)' if resume else ''} ---")
-
-        if use_pipeline:
-            # Feature 038: multi-phase pipeline (full-plan mode only)
-            strategy_config = strategies[default_strategy]
-            input_section = _build_input_section(prompt, spec_path, plan_path)
-            await run_planner_pipeline(
-                strategy_config=strategy_config,
-                prompts_dir=prompts_dir,
-                project_dir=project_dir,
+        if recipe_id == "brownfield-scoped-v1":
+            print("--- PHASE 1: BROWNFIELD SCOPING ---")
+            work_plan = _bootstrap_brownfield_scoped_run(
                 state_dir=state_dir,
                 state_mgr=state_mgr,
-                cost_tracker=cost_tracker,
-                knowledge_section=knowledge_section,
-                input_section=input_section,
-                event_tracker=tracker,
-                config=config,
+                execution_request=execution_request or {},
             )
-            use_work_plan = True
+            n = work_plan.count_tasks()["total"]
+            tracker.run_started(n)
+            try:
+                tracker.push_work_plan(json_mod.loads((state_dir / "work_plan.json").read_text()))
+            except Exception as e:
+                _log_error(state_dir, "push_work_plan_brownfield", e)
+            _write_run_log(state_dir, "planner_skipped", recipe_id=recipe_id, tasks=n)
+            print(f"  Brownfield scope prepared: {n} task(s)")
+            print()
         else:
-            # Feature 039: legacy single-session planner
-            planner_prompt = build_planner_prompt(
-                prompts_dir, prompt, spec_path, plan_path, state_dir, config
-            )
-            planner_options = create_client_options(
-                project_dir,
-                config,
-                model_override=config.get("planner_model"),
-                system_prompt="You are a product architect designing a comprehensive application specification.",
-            )
-            result = await run_agent_session(planner_prompt, planner_options, project_dir, progress_label="Planner")
-            cost_tracker.record("planner", result["cost"],
-                                phase="planner", **_metrics_from(result))
-            print(f"  [Planner] complete. Cost: ${result['cost']:.2f}")
-            use_work_plan = False
+            print(f"--- PHASE 1: PLANNER (delegation: {delegation_mode}){' (resuming)' if resume else ''} ---")
 
-        state_mgr.update_state(
-            phase="generator",
-            planner_complete=True,
-            total_cost_usd=cost_tracker.total,
-            cost_breakdown=cost_tracker.to_dict(),
-        )
-
-        # Validate planner output (feature 046)
-        validation = validate_planner_output(state_dir, use_work_plan=use_work_plan)
-        if not validation["valid"]:
-            print(f"  Planner validation failed: {validation['reason']}")
-            if not use_pipeline:
-                print("  Re-running planner with stricter prompt...")
+            if use_pipeline:
+                # Feature 038: multi-phase pipeline (full-plan mode only)
+                strategy_config = strategies[default_strategy]
+                input_section = _build_input_section(prompt, spec_path, plan_path)
+                await run_planner_pipeline(
+                    strategy_config=strategy_config,
+                    prompts_dir=prompts_dir,
+                    project_dir=project_dir,
+                    state_dir=state_dir,
+                    state_mgr=state_mgr,
+                    cost_tracker=cost_tracker,
+                    knowledge_section=knowledge_section,
+                    input_section=input_section,
+                    event_tracker=tracker,
+                    config=config,
+                )
+                use_work_plan = True
+            else:
+                # Feature 039: legacy single-session planner
                 planner_prompt = build_planner_prompt(
-                    prompts_dir, prompt, spec_path, plan_path, state_dir
+                    prompts_dir, prompt, spec_path, plan_path, state_dir, config
                 )
                 planner_options = create_client_options(
-                    project_dir, config, model_override=config.get("planner_model"),
+                    project_dir,
+                    config,
+                    model_override=config.get("planner_model"),
                     system_prompt="You are a product architect designing a comprehensive application specification.",
                 )
-                retry_prompt = (
-                    planner_prompt
-                    + "\n\n## CRITICAL: PREVIOUS PLANNER RUN FAILED VALIDATION\n\n"
-                    + f"Reason: {validation['reason']}\n\n"
-                    + "You MUST:\n"
-                    + "1. Run all 3 review passes (Technical Gaps, AI Failure Modes, Community Alignment)\n"
-                    + "2. Write findings to SPEC_GAPS.md at {{STATE_DIR}}/SPEC_GAPS.md\n"
-                    + "3. Write a non-empty feature_list.json\n"
-                ).replace("{{STATE_DIR}}", str(state_dir))
-                result2 = await run_agent_session(retry_prompt, planner_options, project_dir)
-                cost_tracker.record("planner", result2["cost"],
-                                    phase="planner-retry", **_metrics_from(result2))
-                validation2 = validate_planner_output(state_dir, use_work_plan=False)
-                if not validation2["valid"]:
-                    print(f"  Planner still invalid after retry: {validation2['reason']}")
-                    print("  Proceeding anyway — evaluator will catch gaps.")
+                result = await run_agent_session(planner_prompt, planner_options, project_dir, progress_label="Planner")
+                cost_tracker.record("planner", result["cost"],
+                                    phase="planner", **_metrics_from(result))
+                print(f"  [Planner] complete. Cost: ${result['cost']:.2f}")
+                use_work_plan = False
+
+            state_mgr.update_state(
+                phase="generator",
+                planner_complete=True,
+                total_cost_usd=cost_tracker.total,
+                cost_breakdown=cost_tracker.to_dict(),
+            )
+
+            # Validate planner output (feature 046)
+            validation = validate_planner_output(state_dir, use_work_plan=use_work_plan)
+            if not validation["valid"]:
+                print(f"  Planner validation failed: {validation['reason']}")
+                if not use_pipeline:
+                    print("  Re-running planner with stricter prompt...")
+                    planner_prompt = build_planner_prompt(
+                        prompts_dir, prompt, spec_path, plan_path, state_dir
+                    )
+                    planner_options = create_client_options(
+                        project_dir, config, model_override=config.get("planner_model"),
+                        system_prompt="You are a product architect designing a comprehensive application specification.",
+                    )
+                    retry_prompt = (
+                        planner_prompt
+                        + "\n\n## CRITICAL: PREVIOUS PLANNER RUN FAILED VALIDATION\n\n"
+                        + f"Reason: {validation['reason']}\n\n"
+                        + "You MUST:\n"
+                        + "1. Run all 3 review passes (Technical Gaps, AI Failure Modes, Community Alignment)\n"
+                        + "2. Write findings to SPEC_GAPS.md at {{STATE_DIR}}/SPEC_GAPS.md\n"
+                        + "3. Write a non-empty feature_list.json\n"
+                    ).replace("{{STATE_DIR}}", str(state_dir))
+                    result2 = await run_agent_session(retry_prompt, planner_options, project_dir)
+                    cost_tracker.record("planner", result2["cost"],
+                                        phase="planner-retry", **_metrics_from(result2))
+                    validation2 = validate_planner_output(state_dir, use_work_plan=False)
+                    if not validation2["valid"]:
+                        print(f"  Planner still invalid after retry: {validation2['reason']}")
+                        print("  Proceeding anyway — evaluator will catch gaps.")
+                    else:
+                        print(f"  Planner validation passed on retry. Cost: ${result2['cost']:.2f}")
                 else:
-                    print(f"  Planner validation passed on retry. Cost: ${result2['cost']:.2f}")
-        else:
-            print(f"  Planner validation: output present")
+                    print(f"  Planner validation: output present")
 
-        # Feature 040: announce run_started with task count
-        if use_work_plan:
-            try:
-                wp = WorkPlan.load(state_dir / "work_plan.json")
-                n = wp.count_tasks()["total"]
-            except Exception:
-                n = 0
-        else:
-            n = state_mgr.count_features().get("total", 0)
-        tracker.run_started(n)
+            # Feature 040: announce run_started with task count
+            if use_work_plan:
+                try:
+                    wp = WorkPlan.load(state_dir / "work_plan.json")
+                    n = wp.count_tasks()["total"]
+                except Exception:
+                    n = 0
+            else:
+                n = state_mgr.count_features().get("total", 0)
+            tracker.run_started(n)
 
-        # Push work plan to control plane for dashboard task view
-        if use_work_plan:
-            try:
-                wp_data = json_mod.loads((state_dir / "work_plan.json").read_text())
-                tracker.push_work_plan(wp_data)
-            except Exception as e:
-                _log_error(state_dir, "push_work_plan_planner", e)
+            # Push work plan to control plane for dashboard task view
+            if use_work_plan:
+                try:
+                    wp_data = json_mod.loads((state_dir / "work_plan.json").read_text())
+                    tracker.push_work_plan(wp_data)
+                except Exception as e:
+                    _log_error(state_dir, "push_work_plan_planner", e)
 
-        _write_run_log(state_dir, "planner_complete",
-                       tasks=n, cost_usd=cost_tracker.total)
-        print()
+            _write_run_log(state_dir, "planner_complete",
+                           tasks=n, cost_usd=cost_tracker.total)
+            print()
 
     # === PHASE 2: GENERATOR ↔ EVALUATOR LOOP ===
     print("--- PHASE 2: GENERATOR + EVALUATOR LOOP ---")
@@ -2328,11 +2465,12 @@ async def run_harness(
         # Skip evaluator if generator errored (rate limit, timeout, etc.)
         # to prevent marking features done based on stale state
         if gen_result.get("status") == "error":
-            print(f"  Generator returned error — skipping evaluator: {gen_result.get('error', 'unknown')}")
-            tracker.feature_fail(feature_id, feature_desc, gen_result.get("error", "generator_error"))
+            error_reason = _session_error(gen_result)
+            print(f"  Generator returned error — skipping evaluator: {error_reason}")
+            tracker.feature_fail(feature_id, feature_desc, error_reason)
             _write_run_log(state_dir, "generator_error",
                            iteration=iteration, feature_id=feature_id,
-                           error=gen_result.get("error", "unknown"))
+                           error=error_reason)
         elif progress.has_progress and feature_counts["remaining"] >= 0:
             _retry = current_state.get("evaluator_retries_current_feature", 0) + 1
             eval_repl, eval_file, eval_fallback, eval_user_msg = _build_eval_replacements(
@@ -2488,6 +2626,120 @@ async def run_harness(
         "cost": cost_tracker.to_dict(),
         "circuit_breaker_opens": cb.total_opens,
     }
+
+
+def _bootstrap_brownfield_scoped_run(
+    *,
+    state_dir: Path,
+    state_mgr: StateManager,
+    execution_request: dict,
+) -> WorkPlan:
+    """Prepare a minimal executable work plan for a small brownfield request."""
+    context_bundle = execution_request.get("context_bundle", {}) or {}
+    request = context_bundle.get("request", {}) or {}
+    assembled = context_bundle.get("assembled_context", {}) or {}
+
+    objective = (
+        execution_request.get("objective")
+        or request.get("title")
+        or assembled.get("objective")
+        or context_bundle.get("prompt")
+        or "Implement requested change"
+    )
+    summary = (
+        assembled.get("request_summary")
+        or request.get("description")
+        or context_bundle.get("prompt")
+        or objective
+    )
+    acceptance_criteria = list(
+        assembled.get("acceptance_criteria")
+        or request.get("acceptance_criteria")
+        or [
+            "The requested change is implemented in the linked scope.",
+            "Existing behavior in the touched scope remains intact.",
+            "Relevant validation or tests for the touched scope pass.",
+        ]
+    )
+    linked_paths = list(
+        assembled.get("linked_paths")
+        or context_bundle.get("linked_paths")
+        or request.get("linked_paths")
+        or []
+    )
+
+    work_plan = WorkPlan(
+        {
+            "phases": [
+                {
+                    "id": "phase-0",
+                    "name": "Scoped Change",
+                    "epics": [
+                        {
+                            "id": "epic-001",
+                            "name": "Brownfield Request",
+                            "stories": [
+                                {
+                                    "id": "story-001",
+                                    "name": objective,
+                                    "tasks": [
+                                        {
+                                            "id": "task-001",
+                                            "description": objective,
+                                            "acceptance_criteria": acceptance_criteria,
+                                            "steps": [
+                                                "Inspect the linked scope and understand the current implementation.",
+                                                "Implement the requested brownfield change with the smallest safe diff.",
+                                                "Validate the linked scope and update only what is necessary.",
+                                            ],
+                                            "depends_on": [],
+                                            "scope": linked_paths,
+                                            "status": "pending",
+                                            "attempts": 0,
+                                            "blocked_reason": None,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    work_plan_path = state_dir / "work_plan.json"
+    work_plan.save(work_plan_path)
+    work_plan.sync_feature_list(state_dir / "feature_list.json")
+
+    spec_lines = [
+        "# Scoped Request Spec",
+        "",
+        "## Overview",
+        "",
+        summary,
+        "",
+        "## Requested Change",
+        "",
+        f"- Objective: {objective}",
+        "",
+        "## Linked Scope",
+        "",
+    ]
+    if linked_paths:
+        spec_lines.extend([f"- `{path}`" for path in linked_paths])
+    else:
+        spec_lines.append("- No linked paths supplied")
+    spec_lines.extend(["", "## Acceptance Criteria", ""])
+    spec_lines.extend([f"- {item}" for item in acceptance_criteria])
+    (state_dir / "spec.md").write_text("\n".join(spec_lines) + "\n", encoding="utf-8")
+
+    state_mgr.update_state(
+        phase="generator",
+        planner_complete=True,
+        current_feature_id=None,
+        evaluator_retries_current_feature=0,
+    )
+    return work_plan
 
 
 def _perform_suspicion_check(state_mgr, config: dict, cb_opens: int, elapsed_total: float, remaining: int) -> Optional[dict]:
