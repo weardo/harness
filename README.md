@@ -2,6 +2,16 @@
 
 Production 3-agent harness for autonomous multi-hour builds with parallel fleet execution.
 
+## Why this exists
+
+I'm a solo developer building seekora.ai — a multi-tenant SaaS across 11 repos in Kubernetes (Go + TypeScript + Temporal + a stack of 7 datastores). Long-running build tasks — multi-file refactors, cross-repo features, end-to-end specs — fail in three ways with off-the-shelf AI tooling:
+
+1. **Context loss mid-run.** The model forgets earlier decisions partway through a multi-hour build.
+2. **Confidently wrong output.** It generates code that runs but is incorrect, and no one catches it.
+3. **Session loss on crash.** Laptop sleeps, network drops, terminal closes — and progress evaporates.
+
+The harness is a production answer to each. Planning is separated from generation, generation from evaluation, and any wave of work resumes cleanly from any crash point. Cursor agent mode, Devin, and Cognition each fit one slice — none fit the specific shape of multi-hour autonomous builds I actually run on my own SaaS.
+
 ## Architecture
 
 ```
@@ -129,6 +139,31 @@ Requirements:
 3. **Evaluator** (N sessions, Sonnet) — grades each feature against acceptance criteria
 4. **Circuit Breaker** — detects stagnation, prevents infinite loops
 5. **Resume** — crash-safe; `--resume` picks up where it left off
+
+## A concrete build (April 2026)
+
+Real plans shipped through the harness from `docs/plans/`:
+
+- `harness-kernel-streamlining-plan.md` — refactoring the orchestrator's core loop
+- `token-efficiency-t0-t2.md` — three-tier token-budget optimization across the planner pipeline
+- `submodule-merge-conflict-resolution.md` — automated cross-repo merge logic
+- `harness-linear-equivalent-prototype-plan.md` — Linear-style work-tracking surface
+- `harness-product-refactor-map.md` — restructuring around the product abstraction
+- `spec-fidelity-kernel.md` — guarantees that generated code stays aligned with the spec
+
+For each: the Planner reads the source spec, produces a hierarchical work plan (Phase → Epic → Story → Task), the Generator runs across N worktrees in parallel, the Evaluator grades each feature against acceptance criteria before allowing merge to the integration branch. Adversary + Refiner + Validator passes catch architectural drift and ensure spec fidelity.
+
+## Failure modes handled in production
+
+Each of these has hit during real builds and shaped how the harness is structured:
+
+- **Stagnation.** Generator gets stuck rewriting the same file or re-running the same failing test. Circuit Breaker (CLOSED → HALF_OPEN → OPEN) detects this and forces a re-plan instead of letting the loop run unbounded. → `src/core/`
+- **Crash recovery.** Laptop sleep, network drop, OOM, accidental terminal close. State persists per-cycle; `--resume` picks up cleanly without redoing finished work. → `specs/graceful-resume-design.md`
+- **Cost overruns.** Runaway loops would otherwise burn the entire budget. Hard `max_cost_usd` limit; fleet halts the moment it's hit, with state preserved for resume after budget top-up. → `src/config.yaml`
+- **Worktree corruption.** Parallel sessions trying to touch the same files. Scope claims + per-worktree isolation make conflicts impossible at the filesystem level; merge-conflict requeue handles them at the branch level. → `src/core/coordination`
+- **Generator/Evaluator disagreement.** Generator says "done", Evaluator says "missing X". Re-queue with updated requirements; Circuit Breaker prevents oscillation by escalating to re-plan after N rounds.
+- **Discovery blackholes.** Parallel agents discovering conflicting facts about the codebase. Discovery relay shares findings between waves so Wave 2 starts with Wave 1's compressed knowledge instead of rediscovering. → `src/core/discovery`
+- **Spec drift.** Generator's interpretation diverges from the original spec over a long run. Spec-fidelity kernel re-anchors against the original spec at validator gates.
 
 ## Development
 
